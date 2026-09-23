@@ -74,5 +74,11 @@ set_tests_properties(runtime_adaptive PROPERTIES ENVIRONMENT "SG_WAIT_POLICY=ada
 add_test(NAME runtime_ticket COMMAND sgtest)
 set_tests_properties(runtime_ticket PROPERTIES ENVIRONMENT "SG_SUBMIT_MODE=ticket" TIMEOUT 120)
 add_test(NAME runtime_ch1_ticket COMMAND sgtest)
-set_tests_properties(runtime_ch1_ticket PROPERTIES ENVIRONMENT "SG_CHANNELS=1;SG_SUBMIT_MODE=ticket" TIMEOUT 120)
+set_tests_properties(runtime_ch1_ticket PROPERTIES ENVIRONMENT "SG_CHANNELS=1;SG_SUBMIT_MODE=ticket" TIMEOUT 400) # yield-publishing is slow under TSan
+# Engine idle gating: `sleep` gates the instant the runlist empties, so every
+# submit races the engine's arm/re-check — the maximal lost-doorbell exposure.
+add_test(NAME runtime_gated COMMAND sgtest)
+set_tests_properties(runtime_gated PROPERTIES ENVIRONMENT "SG_ENGINE_IDLE=sleep;SG_WAIT_POLICY=spin" TIMEOUT 180)
+add_test(NAME runtime_gated_adaptive COMMAND sgtest)
+set_tests_properties(runtime_gated_adaptive PROPERTIES ENVIRONMENT "SG_ENGINE_IDLE=adaptive;SG_ENGINE_IDLE_NS=5000" TIMEOUT 180)
 set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 PROPERTIES TIMEOUT 120)

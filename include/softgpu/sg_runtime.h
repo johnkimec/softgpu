@@ -51,6 +51,10 @@ typedef struct sgStats {
     uint64_t engine_cmds[SG_MAX_ENGINES_RT];
     uint64_t engine_batches[SG_MAX_ENGINES_RT];      /* idle->busy wakes       */
     uint64_t engine_irqs[SG_MAX_ENGINES_RT];         /* interrupts raised      */
+    uint64_t engine_sleep_cycles[SG_MAX_ENGINES_RT]; /* asleep (power-gated)   */
+    uint64_t engine_wakeups[SG_MAX_ENGINES_RT];
+    uint64_t engine_missed_doorbells[SG_MAX_ENGINES_RT];
+    uint64_t engine_cpu_ns[SG_MAX_ENGINES_RT];       /* engine thread CPU, absolute */
     uint64_t driver_submits;
     uint64_t driver_waits;     /* times the host had to wait on the device     */
     uint64_t waits_spun;       /* ... satisfied while spinning                 */

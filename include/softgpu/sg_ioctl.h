@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   6u
+#define SG_ABI_VERSION   7u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_STAGING_SLOTS 8u             /* default pageable-copy staging pool ...    */
 #define SG_STAGING_CHUNK (256ull << 10) /* ... 8 x 256 KiB, from the sweep in ADR 002 */
@@ -59,6 +59,15 @@ enum sg_wait_policy { SG_POLICY_SPIN = 0, SG_POLICY_BLOCK = 1, SG_POLICY_HYBRID 
  * producer claims a slot with fetch_add and publishes in ticket order.
  */
 enum sg_submit_mode { SG_SUBMIT_MUTEX = 0, SG_SUBMIT_TICKET = 1 };
+
+/*
+ * What an engine does when its runlist is empty (SG_ENGINE_IDLE env:
+ * spin | sleep | hybrid | adaptive; SG_ENGINE_IDLE_NS the hybrid budget /
+ * adaptive cap). Sleeping engines are woken by a doorbell write or by
+ * another engine retiring a command; the first command after a sleep pays
+ * the wake-up latency.
+ */
+enum sg_idle_policy { SG_IDLE_SPIN = 0, SG_IDLE_SLEEP = 1, SG_IDLE_HYBRID = 2, SG_IDLE_ADAPTIVE = 3 };
 
 enum sg_opcode {
     SG_OP_NOP        = 0,
@@ -101,6 +110,9 @@ struct sg_query_args {
     uint32_t wait_policy;  /* enum sg_wait_policy in effect */
     uint32_t submit_mode;  /* enum sg_submit_mode in effect */
     uint64_t spin_ns;      /* spin budget before blocking (hybrid; cap for adaptive) */
+    uint32_t idle_policy;  /* enum sg_idle_policy in effect */
+    uint32_t reserved3;
+    uint64_t idle_ns;      /* engine idle budget before sleeping (hybrid; cap for adaptive) */
 };
 
 struct sg_alloc_args {
@@ -157,6 +169,10 @@ struct sg_stats_args {
     uint64_t cmds_executed[SG_MAX_ENGINES];
     uint64_t batches[SG_MAX_ENGINES];       /* idle->busy transitions               */
     uint64_t irqs[SG_MAX_ENGINES];          /* interrupts raised                    */
+    uint64_t sleep_cycles[SG_MAX_ENGINES];  /* asleep (gated)                       */
+    uint64_t wakeups[SG_MAX_ENGINES];       /* times woken (doorbell, fence, timeout) */
+    uint64_t missed_doorbells[SG_MAX_ENGINES]; /* woke by timeout and found work: a lost wake-up */
+    uint64_t cpu_ns[SG_MAX_ENGINES];        /* engine thread CPU time, absolute (never reset) */
     /* driver-side */
     uint64_t submits;       /* driver: SG_IOC_SUBMIT calls                      */
     uint64_t waits;         /* driver: times the host had to wait on a fence    */

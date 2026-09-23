@@ -472,6 +472,10 @@ sgError_t sgGetStats(sgStats_t* out) {
             out->engine_cmds[e] = s.cmds_executed[e];
             out->engine_batches[e] = s.batches[e];
             out->engine_irqs[e] = s.irqs[e];
+            out->engine_sleep_cycles[e] = s.sleep_cycles[e];
+            out->engine_wakeups[e] = s.wakeups[e];
+            out->engine_missed_doorbells[e] = s.missed_doorbells[e];
+            out->engine_cpu_ns[e] = s.cpu_ns[e];
         }
         out->driver_submits = s.submits;
         out->driver_waits = s.waits;

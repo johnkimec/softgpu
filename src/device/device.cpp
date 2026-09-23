@@ -1,7 +1,10 @@
 #include "device/device.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <time.h>
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
@@ -19,6 +22,12 @@ bool is_copy_op(uint32_t op) {
 }
 bool is_compute_op(uint32_t op) {
     return op == SG_OP_FILL || op == SG_OP_VADD_F32 || op == SG_OP_GEMM_F32;
+}
+
+uint64_t thread_cpu_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
 
 } // namespace
@@ -50,9 +59,20 @@ void Device::power_on(int cpu) {
 
 void Device::power_off() {
     if (!running_.exchange(false)) return;
+    for (uint32_t e = 0; e < num_engines_; ++e) bell_[e].signal(); // wake gated engines so they exit
     for (auto& t : engines_)
         if (t.joinable()) t.join();
     engines_.clear();
+}
+
+void Device::wake_blocked_sleepers(uint32_t self) {
+    if (!no_fence_) std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (num_asleep_blocked_.load(std::memory_order_relaxed) == 0) return;
+    for (uint32_t e = 0; e < num_engines_; ++e)
+        if (e != self && asleep_blocked_[e].load(std::memory_order_relaxed)) {
+            wake_stamp_[e].store(now_cycles(), std::memory_order_relaxed);
+            bell_[e].signal();
+        }
 }
 
 void Device::reset_stats() {
@@ -64,6 +84,9 @@ void Device::reset_stats() {
         st.cmds_executed.store(0, std::memory_order_relaxed);
         st.batches.store(0, std::memory_order_relaxed);
         st.irqs.store(0, std::memory_order_relaxed);
+        st.sleep_cycles.store(0, std::memory_order_relaxed);
+        st.wakeups.store(0, std::memory_order_relaxed);
+        st.missed_doorbells.store(0, std::memory_order_relaxed);
         st.stats_gen.fetch_add(1, std::memory_order_release);
     }
 }
@@ -75,12 +98,18 @@ bool Device::vram_range_ok(uint64_t off, uint64_t len) const {
 // One engine's loop: a runlist over its channels. Each round visits every
 // channel with published work and runs it until it empties or its head is a
 // WAIT_FENCE that is not yet satisfied — then moves on rather than blocking,
-// so one stream's semaphore never stalls another stream's commands. Still
-// always-on and spinning when there is nothing to do (stage 7 changes that).
+// so one stream's semaphore never stalls another stream's commands.
+//
+// STAGE 7: when no round has made progress for longer than the idle budget
+// the engine power-gates: it marks itself asleep, re-checks every channel
+// (Dekker: the driver stores PUT then loads `asleep`; we store `asleep`
+// then load the PUTs, seq_cst fences on both sides), and sleeps on its
+// doorbell futex. A 1 ms timeout is the safety net; a timeout wake that
+// finds work is counted as a missed doorbell, which must never happen.
 //
 // Time accounting: executing = busy; a round that made no progress is
 // charged to `wait` if some channel had pending work (all heads blocked) or
-// to `idle` if none did.
+// to `idle` if none did; time asleep is `sleep` (and also idle or wait).
 void Device::run(uint32_t engine) {
     EngineStats& st = stats_[engine];
     struct Cursor { const sg_cmd* ring; uint64_t mask; uint64_t get; };
@@ -93,6 +122,12 @@ void Device::run(uint32_t engine) {
     uint64_t mark = now_cycles();
     uint32_t gen = st.stats_gen.load(std::memory_order_relaxed);
     bool was_active = false;
+    uint64_t gap_start = mark;       // when the current no-progress stretch began
+    uint64_t gap_ewma = 0;           // adaptive: typical idle gap length (ns)
+    uint64_t seen_put[SG_MAX_CHANNELS] = {};
+    uint64_t last_cpu_pub = mark;
+    bool woke = false; // the previous round ended a sleep that was signalled
+    st.cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
 
     while (running_.load(std::memory_order_relaxed)) {
         bool progress = false, pending = false;
@@ -102,6 +137,7 @@ void Device::run(uint32_t engine) {
             // Acquire pairs with the driver's release store of `put` and
             // makes every slot below it visible to this thread.
             uint64_t put = ch.put.load(std::memory_order_acquire);
+            seen_put[c] = put;
             if (put == k.get) continue;
             if (put < k.get) {
                 // PUT behind GET is a driver bug (a doorbell went backwards).
@@ -109,6 +145,7 @@ void Device::run(uint32_t engine) {
                 // than executing whatever is in the ring.
                 int expected = 0;
                 ch.sticky_error.compare_exchange_strong(expected, -EIO, std::memory_order_relaxed);
+                if (std::getenv("SG_TRACE")) std::fprintf(stderr, "[dev] engine %u ch %u PUT %llu < GET %llu\n", engine, c, (unsigned long long)put, (unsigned long long)k.get);
                 continue;
             }
             pending = true;
@@ -132,6 +169,7 @@ void Device::run(uint32_t engine) {
                 if (rc != 0) {
                     int expected = 0;
                     ch.sticky_error.compare_exchange_strong(expected, rc, std::memory_order_relaxed);
+                    if (std::getenv("SG_TRACE")) std::fprintf(stderr, "[dev] engine %u ch %u cmd#%llu opcode %u rc %d\n", engine, c, (unsigned long long)k.get, cmd.opcode, rc);
                 }
                 ++k.get;
                 progress = true;
@@ -140,6 +178,9 @@ void Device::run(uint32_t engine) {
                 // results) so a host or another channel waiting on an early
                 // fence is not held up by the rest. Also frees the slot.
                 ch.get.store(k.get, std::memory_order_release);
+                // A gated engine may be waiting on this fence at the head of
+                // one of its channels.
+                wake_blocked_sleepers(engine);
                 // Interrupt: only when the driver armed one for a fence we
                 // just passed. Clearing before signalling means a waiter that
                 // re-arms after waking cannot miss a later fence.
@@ -157,9 +198,33 @@ void Device::run(uint32_t engine) {
         }
 
         const uint64_t now = now_cycles();
+        // Keep the CPU-time export fresh (about once a millisecond, busy or
+        // idle) so the power proxy is accurate over any window. This is a
+        // syscall on Linux, hence the rate limit.
+        if (now - last_cpu_pub > 1000000) {
+            st.cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
+            last_cpu_pub = now;
+        }
         if (progress) {
-            if (!was_active) st.batches.fetch_add(1, std::memory_order_relaxed);
+            if (!was_active) {
+                st.batches.fetch_add(1, std::memory_order_relaxed);
+                // Adaptive: remember how long we were idle before this work.
+                // If we were asleep, measure to the doorbell's timestamp, not
+                // to now: the wake-up latency is the policy's own penalty and
+                // feeding it back made the estimator lock itself into
+                // sleeping (the same failure stage 2's wait estimator had).
+                // (No CPU-time publish here: CLOCK_THREAD_CPUTIME_ID is a
+                // syscall on Linux and would tax every command after a gap.)
+                uint64_t end = now;
+                if (woke) {
+                    const uint64_t stamp = wake_stamp_[engine].load(std::memory_order_relaxed);
+                    if (stamp > gap_start && stamp < now) end = stamp;
+                }
+                const uint64_t gap = end - gap_start;
+                gap_ewma = gap_ewma == 0 ? gap : (3 * gap_ewma + gap) / 4;
+            }
             was_active = true;
+            woke = false;
         } else {
             // A stats reset while idle restarts the timer, so time from
             // before the reset is not charged to the new window.
@@ -169,7 +234,71 @@ void Device::run(uint32_t engine) {
                 mark = now;
             }
             (pending ? st.wait_cycles : st.idle_cycles).fetch_add(now - mark, std::memory_order_relaxed);
+            if (was_active) gap_start = now;
             was_active = false;
+
+            // Idle gating: how long to keep spinning before sleeping.
+            uint64_t budget;
+            switch (idle_policy_) {
+            case SG_IDLE_SPIN:  budget = ~0ull; break;
+            case SG_IDLE_SLEEP: budget = 0; break;
+            case SG_IDLE_ADAPTIVE:
+                // Gaps have been long: sleep soon. Short: spin through them.
+                budget = gap_ewma == 0 ? idle_ns_
+                       : gap_ewma > idle_ns_ ? 2000
+                       : std::max<uint64_t>(2000, std::min<uint64_t>(2 * gap_ewma, idle_ns_));
+                break;
+            default: budget = idle_ns_; break;
+            }
+            if (budget != ~0ull && now - gap_start >= budget) {
+                // Arm, then re-check (Dekker with Device::doorbell()).
+                const uint32_t seen = bell_[engine].seq();
+                asleep_[engine].store(true, no_fence_ ? std::memory_order_relaxed : std::memory_order_seq_cst);
+                if (pending) {
+                    asleep_blocked_[engine].store(true, std::memory_order_seq_cst);
+                    num_asleep_blocked_.fetch_add(1, std::memory_order_seq_cst);
+                }
+                if (!no_fence_) std::atomic_thread_fence(std::memory_order_seq_cst);
+                bool work = false;
+                for (uint32_t c = 0; c < num_channels_ && !work; ++c) {
+                    const uint64_t p = ch_[engine][c].put.load(no_fence_ ? std::memory_order_relaxed : std::memory_order_seq_cst);
+                    if (p != seen_put[c]) work = true; // a doorbell arrived meanwhile
+                    else if (p != cur[c].get) {
+                        // Blocked head: has its fence passed since we looked?
+                        const sg_cmd& head = cur[c].ring[cur[c].get & cur[c].mask];
+                        if (head.opcode != SG_OP_WAIT_FENCE || head.arg0 >= num_engines_ ||
+                            head.arg1 >= num_channels_ ||
+                            ch_[head.arg0][head.arg1].get.load(std::memory_order_seq_cst) >= head.src1)
+                            work = true;
+                    }
+                }
+                if (!work) {
+                    const uint64_t t_sleep = now_cycles();
+                    st.cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
+                    bell_[engine].wait(seen, 1000000); // 1 ms safety net
+                    const uint64_t t_wake = now_cycles();
+                    st.sleep_cycles.fetch_add(t_wake - t_sleep, std::memory_order_relaxed);
+                    st.wakeups.fetch_add(1, std::memory_order_relaxed);
+                    woke = bell_[engine].seq() != seen;
+                    if (!woke) {
+                        // Timeout, not a signal. If there is work, someone
+                        // rang a doorbell we did not hear: a lost wake-up.
+                        for (uint32_t c = 0; c < num_channels_; ++c)
+                            if (ch_[engine][c].put.load(std::memory_order_acquire) != seen_put[c]) {
+                                st.missed_doorbells.fetch_add(1, std::memory_order_relaxed);
+                                break;
+                            }
+                    }
+                    (pending ? st.wait_cycles : st.idle_cycles).fetch_add(t_wake - t_sleep, std::memory_order_relaxed);
+                    mark = t_wake;
+                }
+                asleep_[engine].store(false, std::memory_order_seq_cst);
+                if (pending) {
+                    asleep_blocked_[engine].store(false, std::memory_order_seq_cst);
+                    num_asleep_blocked_.fetch_sub(1, std::memory_order_seq_cst);
+                }
+                if (!work) { continue; }
+            }
             cpu_relax();
         }
         mark = now;

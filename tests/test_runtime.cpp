@@ -113,18 +113,32 @@ static void test_validation() {
 }
 
 static void test_alloc_reuse_and_oom() {
-    // Fill VRAM, free the middle, make sure coalescing gives it back.
+    // Fill VRAM with 64 MiB chunks until it refuses, then check that freeing
+    // two *adjacent* chunks coalesces into a block big enough for both. The
+    // exact count depends on placement: first-fit with fence-deferred frees
+    // lands earlier tests' blocks differently depending on device timing, so
+    // the test asks for adjacency by address rather than by allocation order.
     const size_t chunk = 64u << 20;
-    sgDevPtr p[4] = {};
-    for (auto& x : p) CHECK_OK(sgMalloc(&x, chunk));
+    std::vector<sgDevPtr> p;
+    for (;;) {
+        sgDevPtr x = 0;
+        sgError_t e = sgMalloc(&x, chunk);
+        if (e == SG_ERR_OUT_OF_MEMORY) break;
+        CHECK_OK(e);
+        p.push_back(x);
+        CHECK(p.size() <= 4);
+    }
+    CHECK(p.size() >= 3);
     sgDevPtr extra = 0;
-    CHECK(sgMalloc(&extra, 1) == SG_ERR_OUT_OF_MEMORY);
-    CHECK_OK(sgFree(p[1]));
-    CHECK_OK(sgFree(p[2]));
-    CHECK_OK(sgMalloc(&extra, 2 * chunk)); // only satisfiable if coalesced
-    CHECK_OK(sgFree(extra));
+    CHECK(sgMalloc(&extra, chunk + 1) == SG_ERR_OUT_OF_MEMORY); // never room for a 5th
+    std::sort(p.begin(), p.end());
+    CHECK(p[1] == p[0] + chunk); // first-fit packs the first two back to back
     CHECK_OK(sgFree(p[0]));
-    CHECK_OK(sgFree(p[3]));
+    CHECK_OK(sgFree(p[1]));
+    CHECK_OK(sgMalloc(&extra, 2 * chunk)); // only satisfiable if coalesced
+    CHECK(extra <= p[0]); // the merged block may also absorb a free fragment just below p[0]
+    CHECK_OK(sgFree(extra));
+    for (size_t i = 2; i < p.size(); ++i) CHECK_OK(sgFree(p[i]));
 }
 
 static void test_async_ordering() {
@@ -711,6 +725,65 @@ static void test_ticket_publish_storm() {
     CHECK_OK(sgDeviceSynchronize()); // would report the sticky error if PUT ever regressed
 }
 
+// ---- stage 7: device idle gating ---------------------------------------------
+
+static void test_gating_no_missed_doorbells() {
+    // Many single tiny commands each followed by a host spin-wait: under a
+    // sleeping engine every submit hits the arm/re-check window. A lost
+    // doorbell shows up as a 1 ms timeout wake that finds work (counted by
+    // the device) and as a >= 1 ms round trip.
+    CHECK_OK(sgSetSyncPolicy(SG_SYNC_SPIN));
+    const int T = 8, iters = 3000;
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgResetStats());
+    CHECK_OK(sgGetStats(&s0));
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    std::vector<double> worst(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &bad, &worst] {
+            sgStream_t s = nullptr;
+            sgDevPtr d = 0;
+            if (sgStreamCreate(&s) != SG_OK || sgMalloc(&d, 64) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                auto t0 = std::chrono::steady_clock::now();
+                if (sgMemsetAsync(d, i, 64, s) != SG_OK || sgStreamSynchronize(s) != SG_OK) bad[t] = 1;
+                double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                if (us > worst[t]) worst[t] = us;
+            }
+            sgFree(d); sgStreamDestroy(s);
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+    CHECK_OK(sgGetStats(&s1));
+    uint64_t missed = 0;
+    for (uint32_t e = 0; e < s1.num_engines; ++e) missed += s1.engine_missed_doorbells[e] - s0.engine_missed_doorbells[e];
+    CHECK(missed == 0);
+    CHECK_OK(sgSetSyncPolicy(SG_SYNC_DEFAULT));
+}
+
+static void test_gating_power_when_idle() {
+    // An idle device should cost (almost) no CPU under a gating policy and
+    // two full cores under `spin`. Only assert when the environment tells us
+    // which policy is in effect; the numbers are recorded either way.
+    CHECK_OK(sgDeviceSynchronize());
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_OK(sgGetStats(&s1));
+    double cpu = 0, sleep = 0;
+    for (uint32_t e = 0; e < s1.num_engines; ++e) {
+        cpu += double(s1.engine_cpu_ns[e] - s0.engine_cpu_ns[e]);
+        sleep += double(s1.engine_sleep_cycles[e] - s0.engine_sleep_cycles[e]);
+    }
+    const double cores = cpu / 100e6; // engine CPU per wall second, in cores
+    const char* pol = std::getenv("SG_ENGINE_IDLE");
+    if (pol && !std::strcmp(pol, "spin")) CHECK(cores > 1.5);
+    else if (pol && !std::strcmp(pol, "sleep")) { CHECK(cores < 0.2); CHECK(sleep > 50e6 * s1.num_engines); }
+    std::printf("      [idle 100 ms: engines used %.2f cores, slept %.0f%%]\n", cores,
+                std::min(100.0, 100.0 * sleep / (100e6 * s1.num_engines)));
+}
+
 static void test_concurrent_submitters() {
     // Many threads hammering the driver; every thread verifies its own data.
     const int T = 8, iters = 200;
@@ -765,6 +838,8 @@ int main() {
         {"alloc_storm_during_submits", test_alloc_storm_during_submits},
         {"pin_storm_during_copies", test_pin_storm_during_copies},
         {"ticket_publish_storm", test_ticket_publish_storm},
+        {"gating_no_missed_doorbells", test_gating_no_missed_doorbells},
+        {"gating_power_when_idle", test_gating_power_when_idle},
         {"concurrent_submitters", test_concurrent_submitters},
     };
     for (auto& t : tests) {

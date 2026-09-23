@@ -49,12 +49,14 @@ configure_and_build() {
 host_load() { sysctl -n vm.loadavg | awk '{print $2}'; }
 
 canary_ns() {
-  remote "cd $BUILD/release && ./sgbench submit --quick 2>/dev/null" \
+  # Pure spin on both sides: the canary measures host thread placement, not
+  # whichever wait/idle policy is the current default.
+  remote "cd $BUILD/release && SG_WAIT_POLICY=spin SG_ENGINE_IDLE=spin ./sgbench submit --quick 2>/dev/null" \
     | awk '/fill_64B_sync/ { for (i = 1; i <= NF; i++) if ($i ~ /^p50_ns=/) { sub("p50_ns=", "", $i); print $i } }'
 }
 
 check_host_quiet() {
-  local ns limit=${SG_CANARY_NS:-800}
+  local ns limit=${SG_CANARY_NS:-350}
   ns=$(canary_ns)
   if [ -z "${SG_FORCE:-}" ] && awk -v v="$ns" -v l="$limit" 'BEGIN{exit !(v+0 > l+0)}'; then
     echo "canary round trip is ${ns} ns (limit ${limit}); host is busy, numbers would be noise." >&2
@@ -106,8 +108,8 @@ case "$cmd" in
     sels=(); flags=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        all) sels+=(submit batch memcpy vadd gemm mt alloc pipeline wait) ;;
-        submit|batch|memcpy|vadd|gemm|mt|alloc|pipeline|wait) sels+=("$1") ;;
+        all) sels+=(submit batch memcpy vadd gemm mt alloc pipeline wait wake) ;;
+        submit|batch|memcpy|vadd|gemm|mt|alloc|pipeline|wait|wake) sels+=("$1") ;;
         --json|--tag|--threads|--repeat) flags+=("$1" "$2"); shift ;;
         *) flags+=("$1") ;;
       esac

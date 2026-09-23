@@ -7,6 +7,11 @@
 // real hardware would expose: MMIO registers and DMA to host addresses the
 // driver hands it.
 //
+// STAGE 7: idle gating. An engine whose runlist has been empty for longer
+// than its idle budget goes to sleep on a per-engine futex instead of
+// spinning; a doorbell write or another engine's retirement wakes it. The
+// engine's own CPU time is exported as the device power proxy.
+//
 // STAGE 3b: several engines, each serving several channels. Engine 0 is
 // the compute engine (FILL, VADD, GEMM); engines 1.. are copy engines
 // (COPY_*). A channel is a ring with its own PUT/GET and fence, executed in
@@ -20,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/clock.h"
 #include "common/event.h"
 #include "softgpu/sg_ioctl.h"
 
@@ -63,6 +69,10 @@ struct alignas(64) EngineStats {
     std::atomic<uint64_t> cmds_executed{0};
     std::atomic<uint64_t> batches{0};   // idle -> busy transitions
     std::atomic<uint64_t> irqs{0};      // interrupts raised
+    std::atomic<uint64_t> sleep_cycles{0};     // time spent power-gated
+    std::atomic<uint64_t> wakeups{0};          // sleeps ended
+    std::atomic<uint64_t> missed_doorbells{0}; // timeout wake that found work waiting
+    std::atomic<uint64_t> cpu_ns{0};           // this engine thread's CPU time (absolute)
     std::atomic<uint32_t> stats_gen{0}; // bumped by reset_stats(); engine restarts its idle timer
 };
 
@@ -87,11 +97,30 @@ public:
     void note_irq(uint64_t t) { last_irq_.store(t, std::memory_order_relaxed); }
     uint64_t vram_size() const { return vram_size_; }
 
+    // Idle gating policy; set before power_on().
+    void set_idle_policy(uint32_t policy, uint64_t idle_ns) { idle_policy_ = policy; idle_ns_ = idle_ns; }
+
     // Bring the engines up / down. power_off() blocks until every engine
     // thread has exited; commands in flight are completed first. `cpu` >= 0
     // pins the compute engine's thread to that CPU (Linux only).
     void power_on(int cpu = -1);
     void power_off();
+
+    // The driver rings this after storing a channel's PUT. Wakes the engine
+    // if it is power-gated. Dekker pattern with the engine's arm/re-check:
+    // both sides store then load, with seq_cst fences in between.
+    void doorbell(uint32_t engine) {
+        if (!no_fence_) std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (asleep_[engine].load(std::memory_order_relaxed)) {
+            // Timestamp the wake so the engine's idle-gap estimator measures
+            // the gap to the doorbell, not to its own (slow) wake-up.
+            wake_stamp_[engine].store(now_cycles(), std::memory_order_relaxed);
+            bell_[engine].signal();
+        }
+    }
+    // SG_EXPERIMENT_NO_FENCE=1: drop the Dekker fences on both sides so the
+    // lost-doorbell race can be *measured* (ADR 006). Never on by default.
+    void set_no_fence(bool v) { no_fence_ = v; }
 
     void reset_stats();
 
@@ -100,10 +129,23 @@ private:
     int execute(uint32_t engine, const sg_cmd& cmd);
     bool vram_range_ok(uint64_t off, uint64_t len) const;
 
+    // Wake gated engines that went to sleep with work pending behind a
+    // WAIT_FENCE (a retirement may have satisfied it). Engines sleeping
+    // with nothing queued are only ever woken by a doorbell.
+    void wake_blocked_sleepers(uint32_t self);
+
     Channel ch_[SG_MAX_ENGINES][SG_MAX_CHANNELS];
     EngineStats stats_[SG_MAX_ENGINES];
     Event irq_;
     std::atomic<uint64_t> last_irq_{0};
+    Event bell_[SG_MAX_ENGINES];
+    std::atomic<bool> asleep_[SG_MAX_ENGINES] = {};
+    std::atomic<bool> asleep_blocked_[SG_MAX_ENGINES] = {}; // asleep with work pending behind a WAIT_FENCE
+    std::atomic<uint64_t> wake_stamp_[SG_MAX_ENGINES] = {}; // when the last wake was requested
+    std::atomic<uint32_t> num_asleep_blocked_{0};
+    uint32_t idle_policy_ = SG_IDLE_HYBRID;
+    uint64_t idle_ns_ = 50000;
+    bool no_fence_ = false;
     uint32_t num_engines_;
     uint32_t num_channels_;
     std::unique_ptr<uint8_t[]> vram_;

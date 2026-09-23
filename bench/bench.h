@@ -115,6 +115,9 @@ struct Window {
     double waits_blocked() const { return double(s1.waits_blocked - s0.waits_blocked); }
     double wake_ns() const { return double(s1.wake_latency_ns - s0.wake_latency_ns); }
     double lock_ns() const { return double(s1.lock_wait_ns - s0.lock_wait_ns); }
+    double engine_cpu() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_cpu_ns[e] - s0.engine_cpu_ns[e]); return n; }
+    double engine_sleep() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_sleep_cycles[e] - s0.engine_sleep_cycles[e]); return n; }
+    double missed() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_missed_doorbells[e] - s0.engine_missed_doorbells[e]); return n; }
     double stalls() const { return double(s1.driver_stalls - s0.driver_stalls); }
     double staging_waits() const { return double(s1.staging_waits - s0.staging_waits); }
     double bytes_direct() const { return double(s1.bytes_direct - s0.bytes_direct); }
@@ -126,6 +129,11 @@ struct Window {
         r.metrics["cpu_ns_per_op"] = cpu_ns() / ops;
         r.metrics["cpu_frac"] = cpu_ns() / std::max(1.0, wall_ns()); // submitter CPU / wall
         r.metrics["lock_ns_per_op"] = lock_ns() / ops; // contended driver-lock time
+        // Device power proxy: engine threads' CPU over the window, in cores
+        // (2.0 = both engines spinning the whole time), and the gated share.
+        r.metrics["dev_cpu_cores"] = engine_cpu() / std::max(1.0, wall_ns());
+        r.metrics["dev_sleep_frac"] = engine_sleep() / std::max(1.0, wall_ns() * engines());
+        r.metrics["missed_doorbells"] = missed();
         if (waits() > 0) r.metrics["blocked_frac"] = waits_blocked() / waits();
         if (waits_blocked() > 0) r.metrics["wake_us"] = wake_ns() / waits_blocked() / 1e3;
         r.metrics["dev_util"] = util(0); // compute engine
@@ -174,5 +182,6 @@ void bench_mt(const Options&, Report&);
 void bench_alloc(const Options&, Report&);
 void bench_pipeline(const Options&, Report&);
 void bench_wait(const Options&, Report&);
+void bench_wake(const Options&, Report&);
 
 } // namespace bench

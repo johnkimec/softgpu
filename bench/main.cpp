@@ -16,7 +16,7 @@ void die_on(sgError_t e, const char* what) {
 
 static void usage() {
     std::fprintf(stderr,
-                 "usage: sgbench [submit|batch|memcpy|vadd|gemm|mt|alloc|pipeline|wait|all]... [--quick] [--json FILE] "
+                 "usage: sgbench [submit|batch|memcpy|vadd|gemm|mt|alloc|pipeline|wait|wake|all]... [--quick] [--json FILE] "
                  "[--tag NAME] [--threads N] [--repeat N]\n");
     std::exit(1);
 }
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
 
     for (const auto& w : which)
         if (w != "all" && w != "submit" && w != "batch" && w != "memcpy" && w != "vadd" &&
-            w != "gemm" && w != "mt" && w != "alloc" && w != "pipeline" && w != "wait")
+            w != "gemm" && w != "mt" && w != "alloc" && w != "pipeline" && w != "wait" && w != "wake")
             usage();
 
     bench::die_on(sgInit(), "sgInit");
@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
             if (all || w == "alloc") bench::bench_alloc(opt, rep);
             if (all || w == "pipeline") bench::bench_pipeline(opt, rep);
             if (all || w == "wait") bench::bench_wait(opt, rep);
+            if (all || w == "wake") bench::bench_wake(opt, rep);
         }
         if (opt.repeat > 1) std::fprintf(stderr, "pass %d/%d done\n", r + 1, opt.repeat);
     }

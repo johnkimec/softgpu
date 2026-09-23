@@ -10,6 +10,7 @@
 //   alloc   - sgMalloc/sgFree cost while work is in flight (deferred frees)
 
 #include <atomic>
+#include <time.h>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -432,6 +433,56 @@ void bench_wait(const Options& o, Report& rep) {
         die_on(sgSetSyncPolicy(SG_SYNC_DEFAULT), "sgSetSyncPolicy");
         sgFree(a); sgFree(b); sgFree(c);
     }
+}
+
+} // namespace bench
+
+namespace bench {
+
+// Idle gating: leave the device idle for a gap, then submit one tiny command
+// and spin-wait for it. Under a spinning engine every gap costs the same
+// round trip; under gating, gaps longer than the idle budget pay the
+// engine's wake-up. dev_cpu_cores over the run is the idle power.
+void bench_wake(const Options& o, Report& rep) {
+    die_on(sgSetSyncPolicy(SG_SYNC_SPIN), "sgSetSyncPolicy");
+    sgDevPtr d = must_malloc(4096);
+    struct Gap { const char* name; long ns; int iters; } gaps[] = {
+        {"1us", 1000, o.quick ? 500 : 5000},
+        {"30us", 30000, o.quick ? 300 : 3000},
+        {"300us", 300000, o.quick ? 100 : 1000},
+        {"3ms", 3000000, o.quick ? 20 : 200},
+        {"30ms", 30000000, o.quick ? 5 : 30},
+    };
+    for (const auto& g : gaps) {
+        std::vector<double> lat;
+        lat.reserve(g.iters);
+        Window w;
+        w.begin();
+        for (int i = 0; i < g.iters; ++i) {
+            // nanosleep() has ~50 us of timer slack on Linux, so short gaps
+            // are produced by busy-waiting on the clock instead.
+            if (g.ns < 100000) {
+                auto until = Clock::now() + std::chrono::nanoseconds(g.ns);
+                while (Clock::now() < until) {}
+            } else {
+                timespec ts{g.ns / 1000000000L, g.ns % 1000000000L};
+                nanosleep(&ts, nullptr);
+            }
+            auto t0 = Clock::now();
+            die_on(sgMemset(d, i, 64), "memset");
+            die_on(sgDeviceSynchronize(), "sync");
+            lat.push_back(ns_since(t0));
+        }
+        w.end();
+        char name[32];
+        std::snprintf(name, sizeof name, "gap=%s", g.name);
+        Row r{"wake", name, {}};
+        latency_row(r, lat);
+        w.fill(r, g.iters);
+        rep.rows.push_back(r);
+    }
+    sgFree(d);
+    die_on(sgSetSyncPolicy(SG_SYNC_DEFAULT), "sgSetSyncPolicy");
 }
 
 } // namespace bench

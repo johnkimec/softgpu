@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -76,6 +77,16 @@ uint32_t policy_from_env() {
     if (!std::strcmp(e, "block")) return SG_POLICY_BLOCK;
     if (!std::strcmp(e, "hybrid")) return SG_POLICY_HYBRID;
     return SG_POLICY_ADAPTIVE;
+}
+constexpr uint64_t kDefaultIdleNs = 50000; // engine idle budget / adaptive cap
+uint64_t idle_ns_from_env() { return env_int("SG_ENGINE_IDLE_NS", kDefaultIdleNs, 0, 10000000000ull); }
+uint32_t idle_policy_from_env() {
+    const char* e = std::getenv("SG_ENGINE_IDLE");
+    if (!e) return SG_IDLE_HYBRID; // fixed 50 us hysteresis, chosen in ADR 006
+    if (!std::strcmp(e, "spin")) return SG_IDLE_SPIN;
+    if (!std::strcmp(e, "sleep")) return SG_IDLE_SLEEP;
+    if (!std::strcmp(e, "hybrid")) return SG_IDLE_HYBRID;
+    return SG_IDLE_ADAPTIVE;
 }
 uint32_t submit_mode_from_env() {
     const char* e = std::getenv("SG_SUBMIT_MODE");
@@ -153,6 +164,8 @@ struct Driver {
     // Wait policy (ADR 004).
     uint32_t policy = SG_POLICY_ADAPTIVE;
     uint64_t spin_ns = kDefaultSpinNs;
+    uint32_t idle_policy = SG_IDLE_HYBRID;
+    uint64_t idle_ns = 50000;
     std::atomic<uint64_t> ewma[SG_MAX_ENGINES][SG_MAX_CHANNELS] = {};
     std::atomic<uint64_t> ewma_all{0};
 
@@ -181,6 +194,10 @@ struct Driver {
         slot.assign(slots, Slot{});
         policy = policy_from_env();
         spin_ns = spin_ns_from_env();
+        idle_policy = idle_policy_from_env();
+        idle_ns = idle_ns_from_env();
+        dev.set_idle_policy(idle_policy, idle_ns);
+        if (const char* e = std::getenv("SG_EXPERIMENT_NO_FENCE")) dev.set_no_fence(*e == '1');
     }
 
     uint8_t* slot_ptr(uint32_t i) { return staging.data() + size_t{i} * chunk; }
@@ -430,6 +447,7 @@ uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd
     // atomic, so TSan had nothing to say; the hang did.
     regs.put.store(slot + 1, std::memory_order_release); // release: slot before doorbell
     p.put.store(slot + 1, std::memory_order_release);
+    d.dev.doorbell(engine); // wake the engine if it is power-gated
     return slot + 1;
 }
 
@@ -716,6 +734,9 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         q->wait_policy = d.policy;
         q->submit_mode = d.submit_mode;
         q->spin_ns = d.spin_ns;
+        q->idle_policy = d.idle_policy;
+        q->reserved3 = 0;
+        q->idle_ns = d.idle_ns;
         return 0;
     }
     case SG_IOC_ALLOC: {
@@ -730,7 +751,12 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             if (int rc = drain(d)) return rc;
             reclaim_locked(d);
             addr = d.vram.alloc(a->size);
-            if (!addr) return -ENOMEM;
+            if (!addr) {
+                if (std::getenv("SG_TRACE"))
+                    std::fprintf(stderr, "[drv] ENOMEM size=%llu live=%llu pending=%zu\n",
+                                 (unsigned long long)a->size, (unsigned long long)d.vram.bytes_live(), d.pending.size());
+                return -ENOMEM;
+            }
         }
         a->addr = *addr;
         return 0;
@@ -803,6 +829,10 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             s->cmds_executed[e] = st.cmds_executed.load(std::memory_order_relaxed);
             s->batches[e] = st.batches.load(std::memory_order_relaxed);
             s->irqs[e] = st.irqs.load(std::memory_order_relaxed);
+            s->sleep_cycles[e] = st.sleep_cycles.load(std::memory_order_relaxed);
+            s->wakeups[e] = st.wakeups.load(std::memory_order_relaxed);
+            s->missed_doorbells[e] = st.missed_doorbells.load(std::memory_order_relaxed);
+            s->cpu_ns[e] = st.cpu_ns.load(std::memory_order_relaxed);
         }
         auto ld = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
         s->submits = ld(d.submits);

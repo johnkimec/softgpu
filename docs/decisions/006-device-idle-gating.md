@@ -53,7 +53,26 @@ rather than asserted.
 **Policy** (`SG_ENGINE_IDLE`, `SG_ENGINE_IDLE_NS`): `spin`, `sleep`,
 `hybrid` (fixed budget), `adaptive` (EWMA of recent idle-gap lengths —
 long gaps → sleep after a 2 µs floor, short gaps → spin up to 2× the
-typical gap, capped). Default decided by the sweep below.
+typical gap, capped). **Default: `hybrid` with a 50 µs budget** — a fixed
+hysteresis timer, which is also what real GPUs do. Adaptive is kept as a
+knob: even after fixing its estimator to measure gaps to the doorbell
+timestamp rather than to its own wake-up (the same self-feedback bug stage
+2's wait estimator had), it still sleeps on some sub-2 µs gaps and costs
+~3× the round trip there (see *Results*). A fixed budget has no state to
+get wrong.
+
+**Wake only the sleepers that need it.** The first cut woke *every*
+sleeping engine on every retirement, so an idle copy engine was kicked
+awake by each memset the compute engine retired: it never got back to sleep
+at short gaps (0.4–0.8 cores of pure overhead) and at long gaps every
+retirement paid a `FUTEX_WAKE` syscall (+600 ns on the round trip). Only
+engines that went to sleep *with work pending behind a WAIT_FENCE* are
+woken by retirements; an idle sleeper is woken by its doorbell alone.
+
+**CPU-time accounting is a syscall.** `CLOCK_THREAD_CPUTIME_ID` is not a
+vDSO read on Linux; publishing it on every idle→busy transition taxed the
+first command after any gap by ~130 ns. It is published at most once a
+millisecond instead.
 
 **Telemetry:** per-engine `sleep_cycles`, `wakeups`, `missed_doorbells`, and
 `cpu_ns` — the engine thread's own `CLOCK_THREAD_CPUTIME_ID`, published on
@@ -84,8 +103,75 @@ change.
 
 ## Results
 
-_(from `results/gated.json`, `gate-{spin,sleep,h10us,h50us,h200us}.json`, `gated-nofence.json`)_
+Stage 4 (`results/nolock.json`) vs stage 7 default (`results/gated.json`,
+hybrid 50 µs), plus `gate-spin.json` and `gate-sleep.json`. Same-cluster
+mode, best of 15 passes across 5 processes per benchmark, canary-gated.
+ASan clean on all 10 variants; TSan clean on 9 — `runtime_ch1_ticket`
+(lock-free ticket publishing, one channel, 8 producers) exceeds even a
+400 s timeout under TSan's slowdown and reports no race; it is the stage 4
+livelock-turned-slow-path, not a gating issue. The fixed-budget sweep and
+the no-fence experiment were cut short (the host spent most of a night in
+its slow placement mode); H4 and H5 are therefore left as stated, not
+confirmed.
+
+### First-command latency vs idle power (`wake`: idle gap, then one 64 B fill + spin-sync)
+
+| gap before the command | `spin` p50 · cores | **`hybrid 50 µs` p50 · cores** | `sleep` p50 · cores |
+|---:|---:|---:|---:|
+| 1 µs | 333 ns · 1.95 | **333 ns · 0.99** | 21.5 µs · 0.27 |
+| 30 µs | 334 ns · 1.99 | **333 ns · 0.98** | 29.4 µs · 0.15 |
+| 300 µs | 459 ns · 2.00 | **49 µs · 0.16** | 49 µs · 0.04 |
+| 3 ms | 2.9 µs · 2.00 | **48 µs · 0.04** | 52 µs · 0.03 |
+| 30 ms | 5.4 µs · 2.00 | **50 µs · 0.03** | 67 µs · 0.03 |
+
+"cores" is `dev_cpu_cores`: engine-thread CPU per wall second, both engines.
+Under `spin` it is 2.0 whatever happens — the number this project had been
+paying since stage 0 without printing it.
+
+* **H1 confirmed.** An idle device now costs 0.03 cores instead of 2.0
+  (−99%). The remaining ~1.0 at short gaps is the *compute* engine legitimately
+  spinning through sub-budget gaps; the copy engine sleeps (its idle cost went
+  from 1.0 to ~0).
+* **H2 confirmed.** The device wake-up is ~48 µs on this VM: a futex wake plus
+  a vCPU that has to be rescheduled onto a host core. Gaps shorter than the
+  budget cost exactly what `spin` costs. Note the `spin` column itself climbs
+  to 2.9–5.4 µs at long gaps: that is the *host* thread waking from
+  `nanosleep` cold; the gating cost is the difference, ~45 µs.
+* **H3 confirmed with one exception.** `submit` (166/292 ns), `memcpy`,
+  `gemm`, `pipeline` wall time (+5–10%) and per-stream `mt` (+2%) are within
+  noise. Default-stream `mt` at 8 threads fell 23%: with all threads serialized
+  on one stream, the compute engine sees gaps long enough to gate and then
+  pays wake-ups — `sleep_frac` confirms it. That workload is pathological by
+  construction (stage 5's ADR); per-stream submission is unaffected.
+* **The `wait` benchmark shows the power story end to end:** during a 14 ms
+  GEMM the host now sleeps (stage 2) *and* the copy engine sleeps (this stage):
+  total device CPU 2.0 → 1.0 cores, i.e. only the engine doing the work.
+
+### What was found and fixed on the way (all measured, see *Decision*)
+
+1. Waking every sleeper on every retirement kept the idle copy engine awake
+   at short gaps (0.4–0.8 cores) and added a `FUTEX_WAKE` syscall (+600 ns)
+   to every round trip at long gaps. Only fence-blocked sleepers are woken now.
+2. Publishing `CLOCK_THREAD_CPUTIME_ID` on each idle→busy transition cost
+   ~130 ns per first-command-after-gap: it is a syscall on Linux.
+3. Adaptive's gap estimator measured its own wake-up latency and locked
+   itself into sleeping (52 µs at 1 µs gaps); timestamping the doorbell fixed
+   the lock-in but adaptive still trails the fixed budget at short gaps
+   (917 vs 333 ns), so the fixed budget is the default.
+4. `nanosleep(1 µs)` on Linux sleeps ~50 µs (timer slack); the benchmark's
+   short gaps are host busy-waits so the rows mean what they say.
 
 ## Consequences
 
-_(after results)_
+* The device power proxy is now a real number in every row (`dev_cpu_cores`)
+  and an idle `softgpu` costs 0.03 cores. Together with stage 2 the whole
+  stack now spends CPU proportional to work, not to time.
+* The price is a ~48 µs first-command latency after any idle stretch longer
+  than 50 µs. Latency-critical callers can set `SG_ENGINE_IDLE=spin`; a
+  per-channel "keep awake" hint is the natural next refinement.
+* The doorbell is now a real wake-up path with a Dekker-style arm/re-check;
+  the stage-8 kernel module's ISR/bottom-half is the same protocol with the
+  fences supplied by the kernel's `smp_mb()`.
+* Two stages in a row, an adaptive estimator failed by measuring its own
+  penalty. Rule recorded: an estimator's input must come from the workload's
+  timeline (doorbell or interrupt timestamps), never from the policy's.
