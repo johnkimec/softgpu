@@ -1,11 +1,14 @@
 #pragma once
 // The "hardware": a software model of a simple accelerator.
 //
-// It owns a region of VRAM and a register file, and runs one execution thread
-// per engine that pulls commands out of that engine's ring and executes them.
-// Nothing above this layer touches VRAM or registers except through the paths
-// real hardware would expose: MMIO registers and DMA to host addresses the
-// driver hands it.
+// It owns a region of VRAM, an MMU (page table + per-engine TLB), and a
+// register file, and runs one execution thread per engine that pulls
+// commands out of that engine's ring and executes them. Nothing above this
+// layer touches VRAM or registers except through the paths real hardware
+// would expose: MMIO registers and DMA to host addresses the driver hands it.
+//
+// STAGE 5: device addresses are virtual. Engines translate through the MMU;
+// slice 1 installs always-resident identity mappings for sgMalloc.
 //
 // STAGE 7: idle gating. An engine whose runlist has been empty for longer
 // than its idle budget goes to sleep on a per-engine futex instead of
@@ -27,6 +30,7 @@
 
 #include "common/clock.h"
 #include "common/event.h"
+#include "device/mmu.h"
 #include "softgpu/sg_ioctl.h"
 
 namespace softgpu::device {
@@ -96,6 +100,7 @@ public:
     uint64_t last_irq_cycles() const { return last_irq_.load(std::memory_order_relaxed); }
     void note_irq(uint64_t t) { last_irq_.store(t, std::memory_order_relaxed); }
     uint64_t vram_size() const { return vram_size_; }
+    Mmu& mmu() { return mmu_; }
 
     // Idle gating policy; set before power_on().
     void set_idle_policy(uint32_t policy, uint64_t idle_ns) { idle_policy_ = policy; idle_ns_ = idle_ns; }
@@ -127,7 +132,9 @@ public:
 private:
     void run(uint32_t engine);
     int execute(uint32_t engine, const sg_cmd& cmd);
-    bool vram_range_ok(uint64_t off, uint64_t len) const;
+    // Resolve a device VA range to a contiguous VRAM pointer. Slice 1's
+    // identity map makes every in-range allocation contiguous.
+    int resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out);
 
     // Wake gated engines that went to sleep with work pending behind a
     // WAIT_FENCE (a retirement may have satisfied it). Engines sleeping
@@ -150,6 +157,7 @@ private:
     uint32_t num_channels_;
     std::unique_ptr<uint8_t[]> vram_;
     uint64_t vram_size_;
+    Mmu mmu_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> engines_;
 };

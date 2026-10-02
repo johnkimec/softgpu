@@ -1,5 +1,6 @@
 #include "device/device.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -34,10 +35,15 @@ uint64_t thread_cpu_ns() {
 
 Device::Device(uint64_t vram_bytes, uint32_t copy_engines, uint32_t channels)
     : num_engines_(1 + copy_engines), num_channels_(channels), vram_(new uint8_t[vram_bytes]),
-      vram_size_(vram_bytes) {
+      vram_size_(vram_bytes), mmu_(vram_bytes) {
     // Touch every page so first-use page faults do not show up as device
     // "busy" time in the first benchmark that runs.
     std::memset(vram_.get(), 0, vram_bytes);
+    // Slice 1: one identity map of the whole aperture (VA == PA). sgMalloc
+    // still hands out offsets inside it; per-allocation maps arrive with
+    // managed memory. Done before power_on(), so no engine is translating yet.
+    const uint64_t npages = vram_bytes / SG_PAGE_SIZE;
+    if (npages != 0 && mmu_.map_vram(0, 0, npages) != 0) std::abort();
 }
 
 Device::~Device() { power_off(); }
@@ -89,10 +95,35 @@ void Device::reset_stats() {
         st.missed_doorbells.store(0, std::memory_order_relaxed);
         st.stats_gen.fetch_add(1, std::memory_order_release);
     }
+    mmu_.reset_stats();
 }
 
-bool Device::vram_range_ok(uint64_t off, uint64_t len) const {
-    return off <= vram_size_ && len <= vram_size_ - off;
+// Translate [va, va+len) through the MMU and require a contiguous VRAM
+// mapping (true for the identity map). Returns a pointer into vram_ usable
+// for the whole range. Host-resident is a fault once migration exists;
+// until then it is -EFAULT, same as not-present.
+int Device::resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out) {
+    if (len == 0) {
+        *out = nullptr;
+        return 0;
+    }
+    uint64_t base = 0;
+    uint64_t left = len;
+    uint64_t cur = va;
+    while (left) {
+        const Translate t = mmu_.translate(engine, cur, write);
+        if (t.status != Translate::Ok) return -EFAULT;
+        const uint64_t off = page_offset(cur);
+        const uint64_t pa = t.pa + off;
+        if (cur == va) base = pa;
+        else if (pa != base + (cur - va)) return -EFAULT; // non-contiguous
+        const uint64_t chunk = std::min(left, SG_PAGE_SIZE - off);
+        cur += chunk;
+        left -= chunk;
+    }
+    if (base > vram_size_ || len > vram_size_ - base) return -EFAULT;
+    *out = vram_.get() + base;
+    return 0;
 }
 
 // One engine's loop: a runlist over its channels. Each round visits every
@@ -306,8 +337,6 @@ void Device::run(uint32_t engine) {
 }
 
 int Device::execute(uint32_t engine, const sg_cmd& c) {
-    uint8_t* vram = vram_.get();
-
     // Engine class check: a real copy engine has no ALUs and a compute engine
     // no DMA. The driver validates this too; the device is the last line.
     if (engine == SG_ENGINE_COMPUTE ? is_copy_op(c.opcode) : is_compute_op(c.opcode))
@@ -317,51 +346,61 @@ int Device::execute(uint32_t engine, const sg_cmd& c) {
     case SG_OP_NOP:
         return 0;
 
-    case SG_OP_FILL:
-        if (!vram_range_ok(c.dst, c.size)) return -EFAULT;
-        std::memset(vram + c.dst, static_cast<int>(c.value & 0xff), c.size);
+    case SG_OP_FILL: {
+        uint8_t* dst = nullptr;
+        if (int rc = resolve(engine, c.dst, c.size, true, &dst)) return rc;
+        std::memset(dst, static_cast<int>(c.value & 0xff), c.size);
         return 0;
+    }
 
     // Host addresses in COPY_H2D/COPY_D2H are trusted, exactly as a DMA
     // engine trusts the bus addresses its driver programs. The driver is
     // responsible for only ever handing it its staging buffers or pinned
-    // user memory.
-    case SG_OP_COPY_H2D:
-        if (!vram_range_ok(c.dst, c.size)) return -EFAULT;
-        std::memcpy(vram + c.dst, reinterpret_cast<const void*>(c.src0), c.size);
+    // user memory. Device addresses go through the MMU.
+    case SG_OP_COPY_H2D: {
+        uint8_t* dst = nullptr;
+        if (int rc = resolve(engine, c.dst, c.size, true, &dst)) return rc;
+        std::memcpy(dst, reinterpret_cast<const void*>(c.src0), c.size);
         return 0;
+    }
 
-    case SG_OP_COPY_D2H:
-        if (!vram_range_ok(c.src0, c.size)) return -EFAULT;
-        std::memcpy(reinterpret_cast<void*>(c.dst), vram + c.src0, c.size);
+    case SG_OP_COPY_D2H: {
+        uint8_t* src = nullptr;
+        if (int rc = resolve(engine, c.src0, c.size, false, &src)) return rc;
+        std::memcpy(reinterpret_cast<void*>(c.dst), src, c.size);
         return 0;
+    }
 
-    case SG_OP_COPY_D2D:
-        if (!vram_range_ok(c.dst, c.size) || !vram_range_ok(c.src0, c.size)) return -EFAULT;
-        std::memmove(vram + c.dst, vram + c.src0, c.size);
+    case SG_OP_COPY_D2D: {
+        uint8_t *dst = nullptr, *src = nullptr;
+        if (int rc = resolve(engine, c.dst, c.size, true, &dst)) return rc;
+        if (int rc = resolve(engine, c.src0, c.size, false, &src)) return rc;
+        std::memmove(dst, src, c.size);
         return 0;
+    }
 
     case SG_OP_VADD_F32: {
         const uint64_t bytes = uint64_t{c.arg0} * sizeof(float);
-        if (!vram_range_ok(c.dst, bytes) || !vram_range_ok(c.src0, bytes) ||
-            !vram_range_ok(c.src1, bytes))
-            return -EFAULT;
-        const float* a = reinterpret_cast<const float*>(vram + c.src0);
-        const float* b = reinterpret_cast<const float*>(vram + c.src1);
-        float* out = reinterpret_cast<float*>(vram + c.dst);
+        uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
+        if (int rc = resolve(engine, c.dst, bytes, true, &dst)) return rc;
+        if (int rc = resolve(engine, c.src0, bytes, false, &s0)) return rc;
+        if (int rc = resolve(engine, c.src1, bytes, false, &s1)) return rc;
+        const float* a = reinterpret_cast<const float*>(s0);
+        const float* b = reinterpret_cast<const float*>(s1);
+        float* out = reinterpret_cast<float*>(dst);
         for (uint32_t i = 0; i < c.arg0; ++i) out[i] = a[i] + b[i];
         return 0;
     }
 
     case SG_OP_GEMM_F32: {
         const uint64_t m = c.arg0, n = c.arg1, k = c.arg2;
-        if (!vram_range_ok(c.src0, m * k * sizeof(float)) ||
-            !vram_range_ok(c.src1, k * n * sizeof(float)) ||
-            !vram_range_ok(c.dst, m * n * sizeof(float)))
-            return -EFAULT;
-        const float* a = reinterpret_cast<const float*>(vram + c.src0);
-        const float* b = reinterpret_cast<const float*>(vram + c.src1);
-        float* out = reinterpret_cast<float*>(vram + c.dst);
+        uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
+        if (int rc = resolve(engine, c.src0, m * k * sizeof(float), false, &s0)) return rc;
+        if (int rc = resolve(engine, c.src1, k * n * sizeof(float), false, &s1)) return rc;
+        if (int rc = resolve(engine, c.dst, m * n * sizeof(float), true, &dst)) return rc;
+        const float* a = reinterpret_cast<const float*>(s0);
+        const float* b = reinterpret_cast<const float*>(s1);
+        float* out = reinterpret_cast<float*>(dst);
         // i-k-j ordering keeps the inner loop streaming over contiguous rows
         // of B and C. Deliberately no blocking; this is the reference engine.
         for (uint64_t i = 0; i < m; ++i) {

@@ -26,7 +26,7 @@ find_package(Threads REQUIRED)
 # only exposes its own headers, so a violation is a build error, not a review
 # comment.
 
-add_library(sg_device STATIC src/device/device.cpp)
+add_library(sg_device STATIC src/device/device.cpp src/device/mmu.cpp)
 target_include_directories(sg_device
   PUBLIC  ${CMAKE_SOURCE_DIR}/include
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
