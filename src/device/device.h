@@ -7,8 +7,10 @@
 // layer touches VRAM or registers except through the paths real hardware
 // would expose: MMIO registers and DMA to host addresses the driver hands it.
 //
-// STAGE 5: device addresses are virtual. Engines translate through the MMU;
-// slice 1 installs always-resident identity mappings for sgMalloc.
+// STAGE 5: device addresses are virtual. Engines translate through the MMU.
+// sgMalloc pages are identity-mapped and always resident. A host-resident
+// page (managed memory) parks the channel, records a fault, and lets the
+// rest of the runlist proceed; the driver migrates the page and unparks.
 //
 // STAGE 7: idle gating. An engine whose runlist has been empty for longer
 // than its idle budget goes to sleep on a per-engine futex instead of
@@ -24,7 +26,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -34,6 +38,10 @@
 #include "softgpu/sg_ioctl.h"
 
 namespace softgpu::device {
+
+// execute() returns this when a page is present but still in host memory.
+// The channel parks; the command is not retired.
+inline constexpr int kPageFault = 1;
 
 // One channel's memory-mapped registers. Each group lives on its own cache
 // line so the producer and consumer sides do not false-share.
@@ -63,6 +71,13 @@ struct alignas(64) Channel {
     // fired, so a woken waiter can measure its wake-up latency.
     alignas(64) std::atomic<uint64_t> irq_target{0};
     std::atomic<uint64_t> last_irq_cycles{0};
+
+    // STAGE 5: set while the head command is waiting on a page fault. The
+    // engine skips the channel; the driver clears it after migrating.
+    // fault_fail is a sticky -errno if the migration itself failed, so the
+    // engine retires the command instead of faulting forever.
+    alignas(64) std::atomic<bool> parked{false};
+    std::atomic<int32_t> fault_fail{0};
 };
 
 // One engine's telemetry (the engine thread accounts across its channels).
@@ -102,6 +117,25 @@ public:
     uint64_t vram_size() const { return vram_size_; }
     Mmu& mmu() { return mmu_; }
 
+    // Page-fault sideband. Distinct from irq() so a migration does not wake
+    // fence waiters. One fault per parked channel; the queue holds them.
+    struct Fault {
+        uint64_t va = 0; // page base
+        uint32_t engine = 0;
+        uint32_t channel = 0;
+    };
+    Event& fault_irq() { return fault_irq_; }
+    void push_fault(const Fault& f);
+    bool pop_fault(Fault* out);
+    // Clear parked and wake the engine if it slept on the fault. Dekker
+    // with the run loop: store parked, then doorbell (which fences and
+    // loads asleep).
+    void unpark(uint32_t engine, uint32_t channel);
+    // Copy one host-resident page into its identity VRAM frame and publish
+    // the PTE. Already-resident is success. Called from the driver's fault
+    // thread, never from an engine.
+    int migrate_in(uint64_t va);
+
     // Idle gating policy; set before power_on().
     void set_idle_policy(uint32_t policy, uint64_t idle_ns) { idle_policy_ = policy; idle_ns_ = idle_ns; }
 
@@ -131,10 +165,11 @@ public:
 
 private:
     void run(uint32_t engine);
-    int execute(uint32_t engine, const sg_cmd& cmd);
-    // Resolve a device VA range to a contiguous VRAM pointer. Slice 1's
-    // identity map makes every in-range allocation contiguous.
-    int resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out);
+    int execute(uint32_t engine, const sg_cmd& cmd, uint64_t* fault_va);
+    // Resolve a device VA range to a contiguous VRAM pointer. A host-resident
+    // page returns kPageFault and writes the page base to fault_va.
+    int resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out,
+                uint64_t* fault_va);
 
     // Wake gated engines that went to sleep with work pending behind a
     // WAIT_FENCE (a retirement may have satisfied it). Engines sleeping
@@ -145,6 +180,9 @@ private:
     EngineStats stats_[SG_MAX_ENGINES];
     Event irq_;
     std::atomic<uint64_t> last_irq_{0};
+    Event fault_irq_;
+    std::mutex fault_mu_;
+    std::deque<Fault> faults_;
     Event bell_[SG_MAX_ENGINES];
     std::atomic<bool> asleep_[SG_MAX_ENGINES] = {};
     std::atomic<bool> asleep_blocked_[SG_MAX_ENGINES] = {}; // asleep with work pending behind a WAIT_FENCE

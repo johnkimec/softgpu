@@ -79,6 +79,13 @@ sgError_t sgMalloc(sgDevPtr* out, size_t bytes);
 sgError_t sgFree(sgDevPtr ptr);
 
 /*
+ * Managed memory. `host` is ordinary memory the CPU may read and write until
+ * the device first touches the allocation; that access copies the pages into
+ * VRAM. sgFree releases both sides.
+ */
+sgError_t sgMallocManaged(sgDevPtr* dev, void** host, size_t bytes);
+
+/*
  * Pinned host memory. Copies to/from pinned memory are DMA'd directly (no
  * staging copy) and may be asynchronous. sgMallocHost allocates and pins;
  * sgHostRegister pins memory you already own (page-aligned ranges recommended).

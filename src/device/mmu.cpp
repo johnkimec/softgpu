@@ -6,6 +6,7 @@ namespace softgpu::device {
 
 Mmu::Mmu(uint64_t va_bytes) : npages_(va_bytes / SG_PAGE_SIZE) {
     pte_.reset(new std::atomic<uint64_t>[npages_]());
+    host_.reset(new std::atomic<uint64_t>[npages_]());
 }
 
 int Mmu::map_vram(uint64_t va, uint64_t pa, uint64_t npages) {
@@ -27,6 +28,59 @@ int Mmu::map_vram(uint64_t va, uint64_t pa, uint64_t npages) {
     return 0;
 }
 
+int Mmu::map_host(uint64_t va, uint64_t host, uint64_t npages) {
+    if ((va | host) & (SG_PAGE_SIZE - 1)) return -EINVAL;
+    if (npages == 0) return -EINVAL;
+    const uint64_t vpn0 = va >> SG_PAGE_SHIFT;
+    if (vpn0 >= npages_ || npages > npages_ - vpn0) return -EINVAL;
+
+    std::lock_guard<std::mutex> g(map_lock_);
+    for (uint64_t i = 0; i < npages; ++i)
+        if (pte_[vpn0 + i].load(std::memory_order_relaxed) & PTE_PRESENT) return -EEXIST;
+    for (uint64_t i = 0; i < npages; ++i) {
+        host_[vpn0 + i].store(host + i * SG_PAGE_SIZE, std::memory_order_relaxed);
+        pte_[vpn0 + i].store(PTE_PRESENT, std::memory_order_release);
+        tlb_invalidate_vpn(vpn0 + i);
+    }
+    return 0;
+}
+
+int Mmu::make_resident(uint64_t va, uint64_t pa) {
+    if ((va | pa) & (SG_PAGE_SIZE - 1)) return -EINVAL;
+    const uint64_t vpn = va >> SG_PAGE_SHIFT;
+    const uint64_t pfn = pa >> SG_PAGE_SHIFT;
+    if (vpn >= npages_ || pfn >= npages_) return -EINVAL;
+
+    std::lock_guard<std::mutex> g(map_lock_);
+    const uint64_t cur = pte_[vpn].load(std::memory_order_acquire);
+    if (!(cur & PTE_PRESENT)) return -EINVAL;
+    if (cur & PTE_IN_VRAM) return 0;
+    const uint64_t neu = PTE_PRESENT | PTE_IN_VRAM | PTE_ACCESSED | (cur & PTE_DIRTY) |
+                         (pfn << PTE_FRAME_SHIFT);
+    pte_[vpn].store(neu, std::memory_order_release);
+    // Same protocol as unmap: an insert that sampled the host PTE drops
+    // its tag instead of caching a translation that is no longer host.
+    tlb_gen_.fetch_add(1, std::memory_order_release);
+    tlb_invalidate_vpn(vpn);
+    return 0;
+}
+
+PageInfo Mmu::page(uint64_t va) const {
+    PageInfo info;
+    const uint64_t vpn = va >> SG_PAGE_SHIFT;
+    if (vpn >= npages_) return info;
+    const uint64_t pte = pte_[vpn].load(std::memory_order_acquire);
+    if (!(pte & PTE_PRESENT)) return info;
+    if (pte & PTE_IN_VRAM) {
+        info.kind = PageInfo::Vram;
+        info.pa = pte_pa(pte);
+        return info;
+    }
+    info.kind = PageInfo::Host;
+    info.host = host_[vpn].load(std::memory_order_acquire);
+    return info;
+}
+
 int Mmu::unmap(uint64_t va, uint64_t npages) {
     if (va & (SG_PAGE_SIZE - 1)) return -EINVAL;
     if (npages == 0) return 0;
@@ -34,8 +88,10 @@ int Mmu::unmap(uint64_t va, uint64_t npages) {
     if (vpn0 >= npages_ || npages > npages_ - vpn0) return -EINVAL;
 
     std::lock_guard<std::mutex> g(map_lock_);
-    for (uint64_t i = 0; i < npages; ++i)
+    for (uint64_t i = 0; i < npages; ++i) {
         pte_[vpn0 + i].store(0, std::memory_order_release);
+        host_[vpn0 + i].store(0, std::memory_order_relaxed);
+    }
     // Publish the generation before the shootdown. An insert that stored
     // its tag after the shootdown re-reads the generation and clears it.
     tlb_gen_.fetch_add(1, std::memory_order_release);

@@ -200,6 +200,19 @@ sgError_t sgFree(sgDevPtr ptr) {
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_FREE, &a));
 }
 
+sgError_t sgMallocManaged(sgDevPtr* dev, void** host, size_t bytes) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!dev || !host || bytes == 0) return SG_ERR_INVALID_VALUE;
+    sg_alloc_managed_args a{};
+    a.size = bytes;
+    int rc = sg_drv_ioctl(g_fd, SG_IOC_ALLOC_MANAGED, &a);
+    if (rc == 0) {
+        *dev = a.addr;
+        *host = reinterpret_cast<void*>(a.host_ptr);
+    }
+    return from_errno(rc);
+}
+
 sgError_t sgMallocHost(void** out, size_t bytes) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     if (!out || bytes == 0) return SG_ERR_INVALID_VALUE;

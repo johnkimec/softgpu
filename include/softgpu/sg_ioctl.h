@@ -18,11 +18,12 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   7u
+#define SG_ABI_VERSION   8u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
+#define SG_PAGE_SIZE     4096ull       /* device page; allocation granularity   */
 #define SG_STAGING_SLOTS 8u             /* default pageable-copy staging pool ...    */
 #define SG_STAGING_CHUNK (256ull << 10) /* ... 8 x 256 KiB, from the sweep in ADR 002 */
-#define SG_ALLOC_ALIGN   256u           /* VRAM allocation granularity            */
+#define SG_ALLOC_ALIGN   SG_PAGE_SIZE   /* VRAM allocation granularity            */
 
 /*
  * Engines and channels. Engine 0 is the compute engine; engines
@@ -117,7 +118,19 @@ struct sg_query_args {
 
 struct sg_alloc_args {
     uint64_t size; /* in  */
-    uint64_t addr; /* out: VRAM offset, SG_ALLOC_ALIGN aligned */
+    uint64_t addr; /* out: device VA, SG_ALLOC_ALIGN aligned */
+};
+
+/*
+ * Managed memory: a device VA plus a host pointer to the same bytes.
+ * Pages start host-resident; the first device access faults and the driver
+ * copies the page into VRAM. Host writes after that access are not visible
+ * to the device until a later slice migrates the page back (userfaultfd).
+ */
+struct sg_alloc_managed_args {
+    uint64_t size;     /* in  */
+    uint64_t addr;     /* out: device VA */
+    uint64_t host_ptr; /* out: host pointer */
 };
 
 struct sg_free_args {
@@ -200,8 +213,9 @@ enum sg_ioc {
     SG_IOC_STATS       = 0x5305, /* sg_stats_args  */
     SG_IOC_RESET_STATS = 0x5306, /* no argument    */
     SG_IOC_WAIT        = 0x5307, /* sg_wait_args   */
-    SG_IOC_PIN         = 0x5308, /* sg_pin_args    */
-    SG_IOC_UNPIN       = 0x5309  /* sg_pin_args (size ignored) */
+    SG_IOC_PIN           = 0x5308, /* sg_pin_args            */
+    SG_IOC_UNPIN         = 0x5309, /* sg_pin_args (size ignored) */
+    SG_IOC_ALLOC_MANAGED = 0x530A  /* sg_alloc_managed_args  */
 };
 
 #ifdef __cplusplus

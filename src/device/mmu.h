@@ -2,10 +2,9 @@
 // Stage 5: device MMU — page table + per-engine TLB.
 //
 // Device addresses in sg_cmd are virtual. Engines translate through a
-// modeled TLB; a miss walks the page table. Slice 1 installs one
-// always-resident identity map of all of VRAM (VA == PA) before the
-// engines start, so sgMalloc's offsets keep working. Later slices add
-// host-resident PTEs, faults, and migration.
+// modeled TLB; a miss walks the page table. sgMalloc installs an
+// always-resident identity map (VA == PA) for its range. Managed pages
+// are present but host-resident until a fault migrates them into VRAM.
 //
 // Page-table entries and TLB tags are atomics: the driver writes them on
 // map/unmap, the engine threads read them on every access. No lock on the
@@ -21,12 +20,12 @@
 namespace softgpu::device {
 
 inline constexpr uint64_t SG_PAGE_SHIFT = 12;
-inline constexpr uint64_t SG_PAGE_SIZE = 1ull << SG_PAGE_SHIFT;
 inline constexpr uint32_t SG_TLB_ENTRIES = 64;
+static_assert(SG_PAGE_SIZE == (1u << SG_PAGE_SHIFT), "SG_PAGE_SIZE must match the shift");
 
 // PTE: flags in the low 12 bits, physical frame number above that.
-// A host pointer does not fit; host-resident pages get their own field
-// when migration lands.
+// A host pointer does not fit in those bits; host-resident pages keep it
+// in a side array.
 inline constexpr uint64_t PTE_PRESENT = 1ull << 0;
 inline constexpr uint64_t PTE_IN_VRAM = 1ull << 1;
 inline constexpr uint64_t PTE_DIRTY = 1ull << 2;
@@ -46,6 +45,14 @@ struct Translate {
     uint64_t pa = 0; // VRAM byte offset of the page base (status == Ok)
 };
 
+// Snapshot of one page, no TLB update. The fault thread uses this; engines
+// use translate(), which may fill a TLB.
+struct PageInfo {
+    enum Kind { Absent, Host, Vram } kind = Absent;
+    uint64_t host = 0; // kind == Host
+    uint64_t pa = 0;   // kind == Vram
+};
+
 class Mmu {
 public:
     explicit Mmu(uint64_t va_bytes);
@@ -56,7 +63,16 @@ public:
     // down. The driver must still not recycle the frame until in-flight
     // commands have retired (same deferred-free rule as VRAM itself).
     int map_vram(uint64_t va, uint64_t pa, uint64_t npages);
+    // Present, not in VRAM. `host` is the address of the first page; the
+    // following pages are contiguous. Device access faults instead of
+    // returning a pointer.
+    int map_host(uint64_t va, uint64_t host, uint64_t npages);
+    // Host-resident page becomes the identity VRAM frame at `pa`.
+    // Already-resident is success.
+    int make_resident(uint64_t va, uint64_t pa);
     int unmap(uint64_t va, uint64_t npages);
+
+    PageInfo page(uint64_t va) const;
 
     // Translate one VA to a VRAM page base. Updates accessed/dirty and the
     // calling engine's TLB. `engine` selects that TLB; only that engine's
@@ -88,7 +104,8 @@ private:
     void tlb_insert(uint32_t engine, uint64_t vpn, uint64_t pte);
     void tlb_invalidate_vpn(uint64_t vpn);
 
-    std::unique_ptr<std::atomic<uint64_t>[]> pte_; // index = VPN
+    std::unique_ptr<std::atomic<uint64_t>[]> pte_;  // index = VPN
+    std::unique_ptr<std::atomic<uint64_t>[]> host_; // valid when present and not in VRAM
     uint64_t npages_;
     EngineTlb tlb_[SG_MAX_ENGINES];
     // Bumped after a PTE is cleared so an insert that raced the unmap

@@ -39,11 +39,6 @@ Device::Device(uint64_t vram_bytes, uint32_t copy_engines, uint32_t channels)
     // Touch every page so first-use page faults do not show up as device
     // "busy" time in the first benchmark that runs.
     std::memset(vram_.get(), 0, vram_bytes);
-    // Slice 1: one identity map of the whole aperture (VA == PA). sgMalloc
-    // still hands out offsets inside it; per-allocation maps arrive with
-    // managed memory. Done before power_on(), so no engine is translating yet.
-    const uint64_t npages = vram_bytes / SG_PAGE_SIZE;
-    if (npages != 0 && mmu_.map_vram(0, 0, npages) != 0) std::abort();
 }
 
 Device::~Device() { power_off(); }
@@ -98,11 +93,43 @@ void Device::reset_stats() {
     mmu_.reset_stats();
 }
 
+void Device::push_fault(const Fault& f) {
+    {
+        std::lock_guard<std::mutex> g(fault_mu_);
+        faults_.push_back(f);
+    }
+    fault_irq_.signal();
+}
+
+bool Device::pop_fault(Fault* out) {
+    std::lock_guard<std::mutex> g(fault_mu_);
+    if (faults_.empty()) return false;
+    *out = faults_.front();
+    faults_.pop_front();
+    return true;
+}
+
+void Device::unpark(uint32_t engine, uint32_t channel) {
+    ch_[engine][channel].parked.store(false, std::memory_order_seq_cst);
+    doorbell(engine);
+}
+
+int Device::migrate_in(uint64_t va) {
+    va = page_floor(va);
+    const PageInfo pg = mmu_.page(va);
+    if (pg.kind == PageInfo::Vram) return 0;
+    if (pg.kind != PageInfo::Host || pg.host == 0) return -EFAULT;
+    if (va >= vram_size_) return -EFAULT;
+    std::memcpy(vram_.get() + va, reinterpret_cast<const void*>(pg.host), SG_PAGE_SIZE);
+    return mmu_.make_resident(va, va);
+}
+
 // Translate [va, va+len) through the MMU and require a contiguous VRAM
-// mapping (true for the identity map). Returns a pointer into vram_ usable
-// for the whole range. Host-resident is a fault once migration exists;
-// until then it is -EFAULT, same as not-present.
-int Device::resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out) {
+// mapping (true for identity-mapped allocations). A host-resident page is a
+// fault: the caller parks the channel and retries the command after the
+// driver migrates that page. Not-present is a hard -EFAULT.
+int Device::resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out,
+                    uint64_t* fault_va) {
     if (len == 0) {
         *out = nullptr;
         return 0;
@@ -112,12 +139,16 @@ int Device::resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint
     uint64_t cur = va;
     while (left) {
         const Translate t = mmu_.translate(engine, cur, write);
+        if (t.status == Translate::HostResident) {
+            *fault_va = page_floor(cur);
+            return kPageFault;
+        }
         if (t.status != Translate::Ok) return -EFAULT;
         const uint64_t off = page_offset(cur);
         const uint64_t pa = t.pa + off;
         if (cur == va) base = pa;
         else if (pa != base + (cur - va)) return -EFAULT; // non-contiguous
-        const uint64_t chunk = std::min(left, SG_PAGE_SIZE - off);
+        const uint64_t chunk = std::min(left, uint64_t{SG_PAGE_SIZE} - off);
         cur += chunk;
         left -= chunk;
     }
@@ -169,6 +200,32 @@ void Device::run(uint32_t engine) {
             // makes every slot below it visible to this thread.
             uint64_t put = ch.put.load(std::memory_order_acquire);
             seen_put[c] = put;
+            if (ch.parked.load(std::memory_order_acquire)) {
+                // Head command is waiting on a migration. Other channels
+                // still run. Unpark rings the doorbell if we sleep.
+                if (put != k.get) pending = true;
+                continue;
+            }
+            const int32_t fail = ch.fault_fail.exchange(0, std::memory_order_acquire);
+            if (fail != 0) {
+                int expected = 0;
+                ch.sticky_error.compare_exchange_strong(expected, fail, std::memory_order_relaxed);
+                if (put != k.get) {
+                    ++k.get;
+                    ch.get.store(k.get, std::memory_order_release);
+                    progress = true;
+                    const uint64_t tgt = ch.irq_target.load(std::memory_order_acquire);
+                    if (tgt != 0 && k.get >= tgt) {
+                        ch.irq_target.store(0, std::memory_order_relaxed);
+                        const uint64_t t = now_cycles();
+                        ch.last_irq_cycles.store(t, std::memory_order_relaxed);
+                        note_irq(t);
+                        st.irqs.fetch_add(1, std::memory_order_relaxed);
+                        irq_.signal();
+                    }
+                }
+                continue;
+            }
             if (put == k.get) continue;
             if (put < k.get) {
                 // PUT behind GET is a driver bug (a doorbell went backwards).
@@ -194,8 +251,16 @@ void Device::run(uint32_t engine) {
                     }
                 } else {
                     const uint64_t t0 = now_cycles();
-                    rc = execute(engine, cmd);
+                    uint64_t fault_va = 0;
+                    rc = execute(engine, cmd, &fault_va);
                     st.busy_cycles.fetch_add(now_cycles() - t0, std::memory_order_relaxed);
+                    if (rc == kPageFault) {
+                        // Park before publishing the fault, so the handler
+                        // cannot unpark a channel we then park again.
+                        ch.parked.store(true, std::memory_order_seq_cst);
+                        push_fault(Fault{fault_va, engine, c});
+                        break;
+                    }
                 }
                 if (rc != 0) {
                     int expected = 0;
@@ -292,6 +357,7 @@ void Device::run(uint32_t engine) {
                 if (!no_fence_) std::atomic_thread_fence(std::memory_order_seq_cst);
                 bool work = false;
                 for (uint32_t c = 0; c < num_channels_ && !work; ++c) {
+                    if (ch_[engine][c].parked.load(std::memory_order_seq_cst)) continue;
                     const uint64_t p = ch_[engine][c].put.load(no_fence_ ? std::memory_order_relaxed : std::memory_order_seq_cst);
                     if (p != seen_put[c]) work = true; // a doorbell arrived meanwhile
                     else if (p != cur[c].get) {
@@ -336,7 +402,7 @@ void Device::run(uint32_t engine) {
     }
 }
 
-int Device::execute(uint32_t engine, const sg_cmd& c) {
+int Device::execute(uint32_t engine, const sg_cmd& c, uint64_t* fault_va) {
     // Engine class check: a real copy engine has no ALUs and a compute engine
     // no DMA. The driver validates this too; the device is the last line.
     if (engine == SG_ENGINE_COMPUTE ? is_copy_op(c.opcode) : is_compute_op(c.opcode))
@@ -348,7 +414,7 @@ int Device::execute(uint32_t engine, const sg_cmd& c) {
 
     case SG_OP_FILL: {
         uint8_t* dst = nullptr;
-        if (int rc = resolve(engine, c.dst, c.size, true, &dst)) return rc;
+        if (int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va)) return rc;
         std::memset(dst, static_cast<int>(c.value & 0xff), c.size);
         return 0;
     }
@@ -359,22 +425,22 @@ int Device::execute(uint32_t engine, const sg_cmd& c) {
     // user memory. Device addresses go through the MMU.
     case SG_OP_COPY_H2D: {
         uint8_t* dst = nullptr;
-        if (int rc = resolve(engine, c.dst, c.size, true, &dst)) return rc;
+        if (int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va)) return rc;
         std::memcpy(dst, reinterpret_cast<const void*>(c.src0), c.size);
         return 0;
     }
 
     case SG_OP_COPY_D2H: {
         uint8_t* src = nullptr;
-        if (int rc = resolve(engine, c.src0, c.size, false, &src)) return rc;
+        if (int rc = resolve(engine, c.src0, c.size, false, &src, fault_va)) return rc;
         std::memcpy(reinterpret_cast<void*>(c.dst), src, c.size);
         return 0;
     }
 
     case SG_OP_COPY_D2D: {
         uint8_t *dst = nullptr, *src = nullptr;
-        if (int rc = resolve(engine, c.dst, c.size, true, &dst)) return rc;
-        if (int rc = resolve(engine, c.src0, c.size, false, &src)) return rc;
+        if (int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va)) return rc;
+        if (int rc = resolve(engine, c.src0, c.size, false, &src, fault_va)) return rc;
         std::memmove(dst, src, c.size);
         return 0;
     }
@@ -382,9 +448,9 @@ int Device::execute(uint32_t engine, const sg_cmd& c) {
     case SG_OP_VADD_F32: {
         const uint64_t bytes = uint64_t{c.arg0} * sizeof(float);
         uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
-        if (int rc = resolve(engine, c.dst, bytes, true, &dst)) return rc;
-        if (int rc = resolve(engine, c.src0, bytes, false, &s0)) return rc;
-        if (int rc = resolve(engine, c.src1, bytes, false, &s1)) return rc;
+        if (int rc = resolve(engine, c.dst, bytes, true, &dst, fault_va)) return rc;
+        if (int rc = resolve(engine, c.src0, bytes, false, &s0, fault_va)) return rc;
+        if (int rc = resolve(engine, c.src1, bytes, false, &s1, fault_va)) return rc;
         const float* a = reinterpret_cast<const float*>(s0);
         const float* b = reinterpret_cast<const float*>(s1);
         float* out = reinterpret_cast<float*>(dst);
@@ -395,9 +461,9 @@ int Device::execute(uint32_t engine, const sg_cmd& c) {
     case SG_OP_GEMM_F32: {
         const uint64_t m = c.arg0, n = c.arg1, k = c.arg2;
         uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
-        if (int rc = resolve(engine, c.src0, m * k * sizeof(float), false, &s0)) return rc;
-        if (int rc = resolve(engine, c.src1, k * n * sizeof(float), false, &s1)) return rc;
-        if (int rc = resolve(engine, c.dst, m * n * sizeof(float), true, &dst)) return rc;
+        if (int rc = resolve(engine, c.src0, m * k * sizeof(float), false, &s0, fault_va)) return rc;
+        if (int rc = resolve(engine, c.src1, k * n * sizeof(float), false, &s1, fault_va)) return rc;
+        if (int rc = resolve(engine, c.dst, m * n * sizeof(float), true, &dst, fault_va)) return rc;
         const float* a = reinterpret_cast<const float*>(s0);
         const float* b = reinterpret_cast<const float*>(s1);
         float* out = reinterpret_cast<float*>(dst);

@@ -806,6 +806,58 @@ static void test_concurrent_submitters() {
     CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
 }
 
+static void test_managed_migrate_in() {
+    // Two pages, so the command faults, retries, and faults again.
+    const size_t n = 8192;
+    sgDevPtr d = 0;
+    void* host_void = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &host_void, n));
+    auto* host = static_cast<uint8_t*>(host_void);
+    for (size_t i = 0; i < n; ++i) host[i] = static_cast<uint8_t>(i);
+    std::vector<uint8_t> out(n, 0);
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    CHECK(std::memcmp(out.data(), host, n) == 0);
+    // Device writes stay in VRAM. D2H observes them; the host pointer does not.
+    CHECK_OK(sgMemset(d, 0x5A, n));
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0x5A; }));
+    CHECK(host[1] == 1);
+    CHECK_OK(sgFree(d));
+    CHECK(sgMallocManaged(nullptr, &host_void, 16) == SG_ERR_INVALID_VALUE);
+    CHECK(sgMallocManaged(&d, nullptr, 16) == SG_ERR_INVALID_VALUE);
+    CHECK(sgMallocManaged(&d, &host_void, 0) == SG_ERR_INVALID_VALUE);
+}
+
+static void test_managed_two_channels() {
+    sgStream_t a = nullptr, b = nullptr;
+    CHECK_OK(sgStreamCreate(&a));
+    CHECK_OK(sgStreamCreate(&b));
+    const size_t n = 4096;
+    sgDevPtr da = 0, db = 0;
+    void *ha_void = nullptr, *hb_void = nullptr;
+    CHECK_OK(sgMallocManaged(&da, &ha_void, n));
+    CHECK_OK(sgMallocManaged(&db, &hb_void, n));
+    auto* ha = static_cast<uint8_t*>(ha_void);
+    auto* hb = static_cast<uint8_t*>(hb_void);
+    std::memset(ha, 0x11, n);
+    std::memset(hb, 0x22, n);
+    uint8_t *pa = nullptr, *pb = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&pa), n));
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&pb), n));
+    CHECK_OK(sgMemcpyD2HAsync(pa, da, n, a));
+    CHECK_OK(sgMemcpyD2HAsync(pb, db, n, b));
+    CHECK_OK(sgStreamSynchronize(a));
+    CHECK_OK(sgStreamSynchronize(b));
+    CHECK(std::all_of(pa, pa + n, [](uint8_t v) { return v == 0x11; }));
+    CHECK(std::all_of(pb, pb + n, [](uint8_t v) { return v == 0x22; }));
+    CHECK_OK(sgFree(da));
+    CHECK_OK(sgFree(db));
+    CHECK_OK(sgFreeHost(pa));
+    CHECK_OK(sgFreeHost(pb));
+    CHECK_OK(sgStreamDestroy(a));
+    CHECK_OK(sgStreamDestroy(b));
+}
+
 int main() {
     CHECK(sgInit() == SG_OK);
     CHECK(sgInit() == SG_ERR_ALREADY_INITIALIZED);
@@ -841,6 +893,8 @@ int main() {
         {"gating_no_missed_doorbells", test_gating_no_missed_doorbells},
         {"gating_power_when_idle", test_gating_power_when_idle},
         {"concurrent_submitters", test_concurrent_submitters},
+        {"managed_migrate_in", test_managed_migrate_in},
+        {"managed_two_channels", test_managed_two_channels},
     };
     for (auto& t : tests) {
         int before = g_failures;

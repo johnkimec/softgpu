@@ -35,6 +35,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common/clock.h"
@@ -115,8 +116,13 @@ struct Pending {
     enum Kind { kVram, kPin } kind;
     uint64_t addr;
     uint64_t size;
+    void* host; // managed backing to free on recycle; nullptr otherwise
     PutSnapshot fence;
 };
+
+struct Driver;
+
+void service_faults(Driver* self);
 
 // Per-channel producer state, on its own cache line.
 struct alignas(64) Producer {
@@ -174,6 +180,13 @@ struct Driver {
     std::atomic<uint64_t> submits{0}, stalls{0}, staging_waits{0}, lock_wait_ns{0};
     std::atomic<uint64_t> bytes_h2d{0}, bytes_d2h{0}, bytes_direct{0}, bytes_staged{0};
 
+    // Managed allocations: device VA -> host backing. The MMU holds the
+    // per-page host address the fault thread copies from; this map owns the
+    // allocation so sgFree can release it after the device is done.
+    std::unordered_map<uint64_t, void*> managed;
+    std::atomic<bool> fault_stop{false};
+    std::thread fault_th;
+
     Driver() {
         num_engines = dev.num_engines();
         num_channels = dev.num_channels();
@@ -198,6 +211,13 @@ struct Driver {
         idle_ns = idle_ns_from_env();
         dev.set_idle_policy(idle_policy, idle_ns);
         if (const char* e = std::getenv("SG_EXPERIMENT_NO_FENCE")) dev.set_no_fence(*e == '1');
+        fault_th = std::thread(service_faults, this);
+    }
+
+    ~Driver() {
+        fault_stop.store(true, std::memory_order_release);
+        dev.fault_irq().signal();
+        if (fault_th.joinable()) fault_th.join();
     }
 
     uint8_t* slot_ptr(uint32_t i) { return staging.data() + size_t{i} * chunk; }
@@ -451,18 +471,23 @@ uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd
     return slot + 1;
 }
 
+// Recycle a detached allocation. Caller holds alloc_lock. Unmap first so a
+// stale TLB cannot observe the frame after it returns to the free list.
+void recycle(Driver& d, const Pending& p) {
+    if (p.kind != Pending::kVram) return;
+    const uint64_t pages = p.size / SG_PAGE_SIZE;
+    if (pages != 0) d.dev.mmu().unmap(p.addr, pages);
+    if (p.host) std::free(p.host);
+    d.vram.release(p.addr, p.size);
+}
+
 // Recycle everything the device has finished with. Caller holds alloc_lock.
 void reclaim_locked(Driver& d) {
     if (d.pending.empty()) return;
     auto keep = d.pending.begin();
     for (auto& p : d.pending) {
-        if (all_retired(d, p.fence)) {
-            if (p.kind == Pending::kVram) d.vram.release(p.addr, p.size);
-            // kPin: nothing to give back in the model; a real driver would
-            // drop its page references / IOMMU mappings here.
-        } else {
-            *keep++ = p;
-        }
+        if (all_retired(d, p.fence)) recycle(d, p);
+        else *keep++ = p;
     }
     d.pending.erase(keep, d.pending.end());
 }
@@ -670,6 +695,25 @@ int do_submit(Driver& d, sg_submit_args& a) {
     }
 }
 
+// UVM thread: migrate host-resident pages and unpark the channel that
+// faulted. Does not take alloc_lock — ALLOC can drain while holding it,
+// and drain waits for this thread to finish the fault.
+void service_faults(Driver* self) {
+    while (!self->fault_stop.load(std::memory_order_acquire)) {
+        device::Device::Fault f;
+        const uint32_t seen = self->dev.fault_irq().seq();
+        if (!self->dev.pop_fault(&f)) {
+            if (self->fault_stop.load(std::memory_order_acquire)) break;
+            self->dev.fault_irq().wait(seen, 1000000000ull);
+            continue;
+        }
+        const int rc = self->dev.migrate_in(f.va);
+        if (rc != 0)
+            self->dev.channel(f.engine, f.channel).fault_fail.store(rc, std::memory_order_release);
+        self->dev.unpark(f.engine, f.channel);
+    }
+}
+
 } // namespace
 } // namespace softgpu::driver
 
@@ -759,6 +803,42 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             }
         }
         a->addr = *addr;
+        const uint64_t pages = (a->size + SG_PAGE_SIZE - 1) / SG_PAGE_SIZE;
+        if (int rc = d.dev.mmu().map_vram(*addr, *addr, pages)) {
+            d.vram.free(*addr);
+            return rc;
+        }
+        return 0;
+    }
+    case SG_IOC_ALLOC_MANAGED: {
+        if (!arg) return -EINVAL;
+        auto* a = static_cast<sg_alloc_managed_args*>(arg);
+        if (a->size == 0) return -EINVAL;
+        ExclusiveGuard g(d, d.alloc_lock);
+        reclaim_locked(d);
+        auto addr = d.vram.alloc(a->size);
+        if (!addr) {
+            if (int rc = drain(d)) return rc;
+            reclaim_locked(d);
+            addr = d.vram.alloc(a->size);
+            if (!addr) return -ENOMEM;
+        }
+        const uint64_t pages = (a->size + SG_PAGE_SIZE - 1) / SG_PAGE_SIZE;
+        const uint64_t bytes = pages * SG_PAGE_SIZE;
+        void* host = nullptr;
+        if (posix_memalign(&host, SG_PAGE_SIZE, bytes) != 0) {
+            d.vram.free(*addr);
+            return -ENOMEM;
+        }
+        std::memset(host, 0, bytes);
+        if (int rc = d.dev.mmu().map_host(*addr, reinterpret_cast<uint64_t>(host), pages)) {
+            std::free(host);
+            d.vram.free(*addr);
+            return rc;
+        }
+        d.managed.emplace(*addr, host);
+        a->addr = *addr;
+        a->host_ptr = reinterpret_cast<uint64_t>(host);
         return 0;
     }
     case SG_IOC_FREE: {
@@ -768,12 +848,18 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         reclaim_locked(d);
         uint64_t size = 0;
         if (!d.vram.detach(addr, &size)) return -EINVAL;
+        void* host = nullptr;
+        if (auto it = d.managed.find(addr); it != d.managed.end()) {
+            host = it->second;
+            d.managed.erase(it);
+        }
         // Nothing may be handed this memory until every command issued so
         // far, on any channel, has retired; recycle it then rather than
-        // draining now.
-        Pending p{Pending::kVram, addr, size, {}};
+        // draining now. The mapping stays until then, so an in-flight fault
+        // can still copy out of the host backing.
+        Pending p{Pending::kVram, addr, size, host, {}};
         snapshot_puts(d, p.fence);
-        if (all_retired(d, p.fence)) d.vram.release(addr, size);
+        if (all_retired(d, p.fence)) recycle(d, p);
         else d.pending.push_back(p);
         return 0;
     }
@@ -799,7 +885,7 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
     case SG_IOC_UNPIN: {
         if (!arg) return -EINVAL;
         auto* p = static_cast<sg_pin_args*>(arg);
-        Pending pend{Pending::kPin, 0, 0, {}};
+        Pending pend{Pending::kPin, 0, 0, nullptr, {}};
         {
             ExclusiveGuard g(d, d.pin_lock);
             auto it = d.pins.find(p->addr);
