@@ -51,6 +51,7 @@ struct sgEvent {
 namespace {
 
 int g_fd = -1;
+int g_managed_coherent = 0;
 uint32_t g_num_engines = 1;
 uint32_t g_num_ce = 0;
 uint32_t g_num_channels = 1;
@@ -164,6 +165,7 @@ sgError_t sgInit(void) {
         return rc ? from_errno(rc) : SG_ERR_DEVICE;
     }
     g_fd = fd;
+    g_managed_coherent = q.uffd ? 1 : 0;
     g_num_engines = q.num_engines;
     g_num_ce = q.num_engines - 1;
     g_num_channels = q.num_channels;
@@ -181,7 +183,17 @@ sgError_t sgShutdown(void) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     int rc = sg_drv_close(g_fd);
     g_fd = -1;
+    g_managed_coherent = 0;
     return from_errno(rc);
+}
+
+int sgManagedCoherent(void) {
+    return g_fd >= 0 && g_managed_coherent ? 1 : 0;
+}
+
+void sgHoldHostFaults(int hold) {
+    if (g_fd < 0) return;
+    sg_drv_ioctl(g_fd, SG_IOC_UFFD_HOLD, &hold);
 }
 
 sgError_t sgMalloc(sgDevPtr* out, size_t bytes) {
@@ -510,6 +522,8 @@ sgError_t sgGetStats(sgStats_t* out) {
         out->um_evictions = s.evictions;
         out->um_writebacks = s.writebacks;
         out->um_bytes_migrated = s.bytes_migrated;
+        out->um_host_faults = s.host_faults;
+        out->um_host_fault_ns = s.host_fault_ns;
     }
     return from_errno(rc);
 }

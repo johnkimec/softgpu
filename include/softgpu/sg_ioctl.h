@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   9u
+#define SG_ABI_VERSION   10u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_PAGE_SIZE     4096ull       /* device page; allocation granularity   */
 #define SG_VA_SIZE       (1ull << 30)  /* device VA space: [0, VRAM) sgMalloc (VA == PA), [VRAM, VA) managed */
@@ -113,7 +113,7 @@ struct sg_query_args {
     uint32_t submit_mode;  /* enum sg_submit_mode in effect */
     uint64_t spin_ns;      /* spin budget before blocking (hybrid; cap for adaptive) */
     uint32_t idle_policy;  /* enum sg_idle_policy in effect */
-    uint32_t reserved3;
+    uint32_t uffd;         /* 1: host touches of in-VRAM managed pages fault and migrate back */
     uint64_t idle_ns;      /* engine idle budget before sleeping (hybrid; cap for adaptive) */
 };
 
@@ -128,8 +128,10 @@ struct sg_alloc_args {
  * copies the page into a free VRAM frame, evicting another managed page
  * (written back if dirty) when none is free, so managed memory may exceed
  * VRAM. Host writes after the device's first access are not visible to the
- * device until a later slice migrates the page back (userfaultfd); device
- * writes reach the host pointer when the page is evicted. When faults on a
+ * device. With userfaultfd (Linux, QUERY.uffd = 1; SG_UFFD=0 disables it)
+ * the next host access faults and the page is migrated back first; without
+ * it, host writes after that first access stay stale and device writes
+ * reach the host pointer only when the page is evicted. When faults on a
  * channel walk forward page by page, the driver also migrates the next
  * SG_PREFETCH_PAGES pages of the same allocation (env; default 16, 0 = off).
  */
@@ -214,6 +216,8 @@ struct sg_stats_args {
     uint64_t evictions;     /* pages moved out of VRAM to make room             */
     uint64_t writebacks;    /* ... of which dirty, copied VRAM -> host          */
     uint64_t bytes_migrated; /* migration DMA, both directions                  */
+    uint64_t host_faults;   /* host accesses that migrated a page back          */
+    uint64_t host_fault_ns; /* summed handler time for those (not the wakeup)   */
 };
 
 /*
@@ -230,7 +234,10 @@ enum sg_ioc {
     SG_IOC_WAIT        = 0x5307, /* sg_wait_args   */
     SG_IOC_PIN           = 0x5308, /* sg_pin_args            */
     SG_IOC_UNPIN         = 0x5309, /* sg_pin_args (size ignored) */
-    SG_IOC_ALLOC_MANAGED = 0x530A  /* sg_alloc_managed_args  */
+    SG_IOC_ALLOC_MANAGED = 0x530A, /* sg_alloc_managed_args  */
+    /* Test latch: nonzero makes the host-fault handler wait before mem_lock.
+     * int *. Not a device feature. */
+    SG_IOC_UFFD_HOLD     = 0x530B
 };
 
 #ifdef __cplusplus

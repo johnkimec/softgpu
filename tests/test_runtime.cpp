@@ -2,8 +2,11 @@
 // a CHECK macro and a process exit code are all ctest needs.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
+#include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -821,7 +824,9 @@ static void test_managed_migrate_in() {
     CHECK_OK(sgMemset(d, 0x5A, n));
     CHECK_OK(sgMemcpyD2H(out.data(), d, n));
     CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0x5A; }));
-    CHECK(host[1] == 1);
+    // Without userfaultfd the host page is stale. With it, the load migrates
+    // the device's write back.
+    CHECK(host[1] == (sgManagedCoherent() ? 0x5A : 1));
     CHECK_OK(sgFree(d));
     CHECK(sgMallocManaged(nullptr, &host_void, 16) == SG_ERR_INVALID_VALUE);
     CHECK(sgMallocManaged(&d, nullptr, 16) == SG_ERR_INVALID_VALUE);
@@ -1044,13 +1049,17 @@ static void test_managed_stats() {
     CHECK_OK(sgMallocManaged(&d, &hv, n));
     auto* host = static_cast<uint8_t*>(hv);
     for (size_t i = 0; i < n; ++i) host[i] = uint8_t(i * 3 + 1);
+    // Snapshot: comparing against `host` later would fault every page back
+    // out of VRAM once userfaultfd is on, and the second pass below expects
+    // those pages to still be resident.
+    const std::vector<uint8_t> expect(host, host + n);
     uint8_t* out = nullptr;
     CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&out), n));
     sgStats_t s0{}, s1{}, s2{};
     CHECK_OK(sgGetStats(&s0));
     CHECK_OK(sgMemcpyD2H(out, d, n));
     CHECK_OK(sgGetStats(&s1));
-    CHECK(std::memcmp(out, host, n) == 0);
+    CHECK(std::memcmp(out, expect.data(), n) == 0);
     VmDelta v = vm_delta(s0, s1);
     CHECK(v.faults >= 1 && v.faults <= pages);
     CHECK(v.migrations == pages);
@@ -1078,7 +1087,10 @@ static void test_managed_stats() {
     v = vm_delta(s3, s4);
     CHECK(v.evictions >= pages - 8);
     CHECK(v.writebacks >= 1 && v.writebacks <= v.evictions);
-    CHECK(v.bytes == (v.migrations + v.writebacks) * pg);
+    // userfaultfd copies every evicted page back, clean or not. Without it
+    // only dirty pages move.
+    if (sgManagedCoherent()) CHECK(v.bytes == (v.migrations + v.evictions) * pg);
+    else CHECK(v.bytes == (v.migrations + v.writebacks) * pg);
     CHECK_OK(sgMemcpyD2H(out, d, n));
     CHECK(std::all_of(out, out + n, [](uint8_t x) { return x == 0x3C; }));
     for (sgDevPtr p : held) CHECK_OK(sgFree(p));
@@ -1219,6 +1231,140 @@ static void test_managed_prefetch_under_pressure() {
     }
 }
 
+// ---- stage 5 slice 5: host faults migrate a page back --------------------
+
+static thread_local sigjmp_buf tl_bus_jmp;
+static thread_local volatile sig_atomic_t tl_bus_armed = 0;
+
+static void on_sigbus(int) {
+    if (tl_bus_armed) siglongjmp(tl_bus_jmp, 1);
+}
+
+struct HoldHostFaults {
+    HoldHostFaults() { sgHoldHostFaults(1); }
+    ~HoldHostFaults() { sgHoldHostFaults(0); }
+};
+
+static void test_managed_pingpong() {
+    // Host write after a device write is visible to the next device read,
+    // and a device write is visible to a host read with no pressure eviction.
+    if (!sgManagedCoherent()) return;
+    const size_t n = 4096;
+    sgDevPtr d = 0;
+    void* hv = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &hv, n));
+    auto* host = static_cast<uint8_t*>(hv);
+    std::memset(host, 0x01, n);
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemset(d, 0x11, n));
+    CHECK_OK(sgDeviceSynchronize()); // sgMemset only queues the fill
+    CHECK(host[0] == 0x11);
+    host[0] = 0x22;
+    std::vector<uint8_t> out(n);
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    CHECK(out[0] == 0x22);
+    bool rest = true;
+    for (size_t i = 1; i < n && rest; ++i) rest = out[i] == 0x11;
+    CHECK(rest);
+    CHECK_OK(sgMemset(d, 0x33, n));
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK(host[3] == 0x33);
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(s1.um_host_faults - s0.um_host_faults >= 2);
+    CHECK(s1.um_evictions - s0.um_evictions >= 2);
+    CHECK_OK(sgFree(d));
+}
+
+static void test_managed_host_other_page() {
+    // A host fault on page 0 while commands run on page 1 of the same
+    // allocation. The two pages must not trade bytes.
+    if (!sgManagedCoherent()) return;
+    const size_t pg = 4096;
+    sgDevPtr d = 0;
+    void* hv = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &hv, pg * 2));
+    auto* host = static_cast<uint8_t*>(hv);
+    std::memset(host, 0x11, pg * 2);
+    CHECK_OK(sgMemset(d, 0x11, pg * 2));
+    CHECK_OK(sgDeviceSynchronize());
+    sgStream_t s = nullptr;
+    CHECK_OK(sgStreamCreate(&s));
+    std::atomic<int> started{0};
+    std::thread th([&] {
+        started.store(1, std::memory_order_release);
+        host[0] = 0x42;
+        host[1] = 0x42;
+    });
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    for (int i = 0; i < 200; ++i) CHECK_OK(sgMemsetAsync(d + pg, 0x44, pg, s));
+    th.join();
+    CHECK_OK(sgStreamSynchronize(s));
+    std::vector<uint8_t> out(pg);
+    CHECK_OK(sgMemcpyD2H(out.data(), d, pg));
+    CHECK(out[0] == 0x42 && out[1] == 0x42);
+    CHECK_OK(sgMemcpyD2H(out.data(), d + pg, pg));
+    bool page1 = true;
+    for (uint8_t v : out) page1 = page1 && v == 0x44;
+    CHECK(page1);
+    CHECK_OK(sgStreamDestroy(s));
+    CHECK_OK(sgFree(d));
+}
+
+static void test_managed_free_during_host_fault() {
+    // sgFree while a host thread is blocked in the fault. The handler is
+    // held off mem_lock (sgHoldHostFaults) so recycle's unregister runs
+    // first and has to wake that thread. A signal from the racing munmap
+    // is a successful wake; a hang is not.
+    if (!sgManagedCoherent()) return;
+    const size_t n = 4096;
+    sgDevPtr d = 0;
+    void* hv = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &hv, n));
+    auto* host = static_cast<uint8_t*>(hv);
+    CHECK_OK(sgMemset(d, 0xAB, n));
+    CHECK_OK(sgDeviceSynchronize());
+    HoldHostFaults hold;
+
+    // A racing munmap delivers SIGSEGV; a fault on a file mapping would be
+    // SIGBUS. Either one means the blocked reader was woken.
+    struct sigaction sa{}, old_bus{}, old_segv{};
+    sa.sa_handler = on_sigbus;
+    sigaction(SIGBUS, &sa, &old_bus);
+    sigaction(SIGSEGV, &sa, &old_segv);
+
+    sgStats_t s0{};
+    CHECK_OK(sgGetStats(&s0));
+    std::atomic<int> value{-1};
+    std::atomic<int> saw_bus{0};
+    std::thread th([&] {
+        if (sigsetjmp(tl_bus_jmp, 1) == 0) {
+            tl_bus_armed = 1;
+            value.store(host[0], std::memory_order_release);
+        } else {
+            saw_bus.store(1, std::memory_order_release);
+        }
+        tl_bus_armed = 0;
+    });
+
+    bool pending = false;
+    for (int i = 0; i < 1000000 && !pending; ++i) {
+        sgStats_t s{};
+        if (sgGetStats(&s) == SG_OK && s.um_host_faults > s0.um_host_faults) pending = true;
+        else std::this_thread::yield();
+    }
+    CHECK(pending);
+    CHECK_OK(sgFree(d));
+    sgHoldHostFaults(0);
+    th.join();
+    sigaction(SIGBUS, &old_bus, nullptr);
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    if (!saw_bus.load()) {
+        const int v = value.load();
+        CHECK(v == 0xAB || v == 0);
+    }
+}
+
 static void test_tlb_reach() {
     // The compute TLB has 64 entries with LRU replacement. A working set
     // inside its reach hits on every later pass; a cyclic walk over twice
@@ -1287,6 +1433,9 @@ int main() {
         {"managed_prefetch_strided", test_managed_prefetch_strided},
         {"managed_prefetch_stays_in_allocation", test_managed_prefetch_stays_in_allocation},
         {"managed_prefetch_under_pressure", test_managed_prefetch_under_pressure},
+        {"managed_pingpong", test_managed_pingpong},
+        {"managed_host_other_page", test_managed_host_other_page},
+        {"managed_free_during_host_fault", test_managed_free_during_host_fault},
         {"tlb_reach", test_tlb_reach},
     };
     for (auto& t : tests) {

@@ -565,6 +565,37 @@ void bench_fault(const Options& o, Report& rep) {
         }
         sgFreeHost(pinned);
     }
+
+    // One page, device touch then host touch. With userfaultfd each round
+    // migrates the page into VRAM and back; without it the host load does
+    // not fault and does not observe the device write.
+    {
+        const int rounds = o.quick ? 100 : 400;
+        sgDevPtr d = 0;
+        void* host = nullptr;
+        die_on(sgMallocManaged(&d, &host, kPage), "sgMallocManaged");
+        die_on(sgMemset(d, 1, kPage), "memset");
+        die_on(sgDeviceSynchronize(), "sync");
+        auto* bytes = static_cast<volatile uint8_t*>(host);
+        volatile uint8_t sink = bytes[0];
+        Window w;
+        w.begin();
+        const auto t0 = Clock::now();
+        for (int i = 0; i < rounds; ++i) {
+            die_on(sgMemset(d, i & 0xff, kPage), "memset");
+            die_on(sgDeviceSynchronize(), "sync");
+            sink = bytes[0];
+        }
+        const double touch_ns = ns_since(t0);
+        w.end();
+        Row r{"fault", "pingpong", {}};
+        r.metrics["us_per_round"] = touch_ns / rounds / 1e3;
+        r.metrics["host_faults"] = w.host_faults();
+        w.fill(r, rounds);
+        rep.rows.push_back(r);
+        (void)sink;
+        die_on(sgFree(d), "sgFree");
+    }
 }
 
 // Translation on resident memory: sgMalloc only, no faults, just the

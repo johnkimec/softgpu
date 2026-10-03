@@ -42,10 +42,11 @@ configure_and_build() {
 
 # The VM's vCPUs are ordinary host threads: a busy Mac makes every number
 # worse, and macOS load average does not predict it well. The guard is a
-# canary: one device round trip. It is bimodal (~210 ns when the two threads
-# share a CPU cluster, ~590 ns across clusters), so the limit is set above
-# both modes and only catches genuinely heavy load; placement noise is
-# handled by sgbench --repeat.
+# canary: one device round trip. Placement is bimodal. As of stage 5 the
+# fast cluster reads ~333 ns, sometimes ~375; across clusters it is ~750.
+# The limit sits above the fast readings and rejects the slow one.
+# Re-measure when the fast path changes — a stale limit idles the job.
+# Placement noise inside a mode is handled by sgbench --repeat.
 host_load() { sysctl -n vm.loadavg | awk '{print $2}'; }
 
 canary_ns() {
@@ -56,7 +57,7 @@ canary_ns() {
 }
 
 check_host_quiet() {
-  local ns limit=${SG_CANARY_NS:-350}
+  local ns limit=${SG_CANARY_NS:-400}
   ns=$(canary_ns)
   if [ -z "${SG_FORCE:-}" ] && awk -v v="$ns" -v l="$limit" 'BEGIN{exit !(v+0 > l+0)}'; then
     echo "canary round trip is ${ns} ns (limit ${limit}); host is busy, numbers would be noise." >&2

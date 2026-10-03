@@ -131,6 +131,8 @@ struct Window {
     double evictions() const { return double(s1.um_evictions - s0.um_evictions); }
     double writebacks() const { return double(s1.um_writebacks - s0.um_writebacks); }
     double bytes_migrated() const { return double(s1.um_bytes_migrated - s0.um_bytes_migrated); }
+    double host_faults() const { return double(s1.um_host_faults - s0.um_host_faults); }
+    double host_fault_ns() const { return double(s1.um_host_fault_ns - s0.um_host_fault_ns); }
 
     // Fill the standard metrics every benchmark reports.
     void fill(Row& r, double ops) const {
@@ -178,6 +180,10 @@ struct Window {
             r.metrics["evictions_per_op"] = evictions() / ops;
             r.metrics["writebacks_per_op"] = writebacks() / ops;
             r.metrics["migrate_GBps"] = bytes_migrated() / std::max(1.0, wall_ns());
+        }
+        if (host_faults() > 0) {
+            r.metrics["host_faults_per_op"] = host_faults() / ops;
+            r.metrics["host_fault_us"] = host_fault_ns() / host_faults() / 1e3;
         }
     }
 };

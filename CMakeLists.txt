@@ -84,4 +84,7 @@ set_tests_properties(runtime_gated_adaptive PROPERTIES ENVIRONMENT "SG_ENGINE_ID
 # Managed memory with prefetch off: every page is its own fault.
 add_test(NAME runtime_prefetch0 COMMAND sgtest)
 set_tests_properties(runtime_prefetch0 PROPERTIES ENVIRONMENT "SG_PREFETCH_PAGES=0")
-set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 runtime_prefetch0 PROPERTIES TIMEOUT 120)
+# One-way managed memory: host writes after the first device touch stay stale.
+add_test(NAME runtime_uffd0 COMMAND sgtest)
+set_tests_properties(runtime_uffd0 PROPERTIES ENVIRONMENT "SG_UFFD=0")
+set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 runtime_prefetch0 runtime_uffd0 PROPERTIES TIMEOUT 120)

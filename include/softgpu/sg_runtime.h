@@ -75,6 +75,8 @@ typedef struct sgStats {
     uint64_t um_evictions;     /* managed pages moved out of VRAM              */
     uint64_t um_writebacks;    /* ... of which dirty (copied back to host)     */
     uint64_t um_bytes_migrated; /* migration traffic, both directions          */
+    uint64_t um_host_faults;    /* host accesses that migrated a page back     */
+    uint64_t um_host_fault_ns;  /* summed handler time for those               */
 } sgStats_t;
 
 /* Lifecycle. Not thread-safe with respect to each other. */
@@ -87,13 +89,21 @@ sgError_t sgMalloc(sgDevPtr* out, size_t bytes);
 sgError_t sgFree(sgDevPtr ptr);
 
 /*
- * Managed memory. `host` is ordinary memory the CPU may read and write until
- * the device first touches the allocation; that access copies the pages into
- * VRAM. Managed memory may exceed VRAM: under pressure, pages move back to
- * `host` (with the device's writes) and fault in again on the next access.
- * sgFree releases both sides.
+ * Managed memory. `host` is ordinary memory the CPU may read and write; the
+ * device sees the same bytes. The first device access copies a page into
+ * VRAM. When sgManagedCoherent() is nonzero, a later host access to a page
+ * that lives in VRAM faults and copies it back first. Otherwise host writes
+ * after that first device access are not visible to the device, and device
+ * writes reach `host` only when the page is evicted. Managed memory may
+ * exceed VRAM. sgFree releases both sides.
  */
 sgError_t sgMallocManaged(sgDevPtr* dev, void** host, size_t bytes);
+/* 1 when host accesses migrate in-VRAM managed pages back (Linux userfaultfd). */
+int sgManagedCoherent(void);
+/* Test latch. While held, a host fault is counted and then waits before the
+ * handler takes its lock, so sgFree can run against a blocked host access.
+ * Not a device feature. */
+void sgHoldHostFaults(int hold);
 
 /*
  * Pinned host memory. Copies to/from pinned memory are DMA'd directly (no

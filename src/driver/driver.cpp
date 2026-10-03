@@ -9,8 +9,8 @@
 // onto the pending list), alloc_lock -> mem_lock (allocation and recycling
 // touch frames). Channel locks nest inside nothing and nothing nests inside
 // them except the staging lock (briefly, for slot bookkeeping). The fault
-// thread takes mem_lock only: ALLOC drains while holding alloc_lock, and
-// the drain may be waiting on a fault.
+// thread and the userfaultfd thread take mem_lock only: ALLOC drains while
+// holding alloc_lock, and the drain may be waiting on a fault.
 //
 // STAGE 5: two address spaces. Device VAs [0, VRAM) are sgMalloc, mapped
 // VA == PA and resident for life; [VRAM, SG_VA_SIZE) are managed. VRAM
@@ -18,6 +18,9 @@
 // managed page takes one frame when it faults in and gives it back when it
 // is evicted (CLOCK over resident managed pages) or freed. A fault that
 // continues a channel's sequential walk also prefetches the next pages.
+// On Linux, when a userfaultfd is open, migrating a page into VRAM drops
+// the host copy; the next host touch faults and a second thread migrates
+// the page back (ADR 007 slice 5). SG_UFFD=0 leaves the one-way model.
 //
 // STAGE 2: interrupts and a wait policy. Every place the host waits for a
 // fence goes through wait_until(): spin for a budget, then arm the channel's
@@ -31,6 +34,10 @@
 // <= that channel's PUT at submission time, i.e. the command it waits for was
 // enqueued before the WAIT itself. By induction on enqueue order the
 // dependency graph is a DAG, so no engine can wait on something behind it.
+
+#if defined(__linux__)
+#define _GNU_SOURCE 1
+#endif
 
 #include "driver/sg_driver.h"
 
@@ -49,6 +56,21 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
+#include <sys/mman.h>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/userfaultfd.h>
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
+#endif
+#endif
 
 #include "common/clock.h"
 #include "common/cpu.h"
@@ -153,6 +175,10 @@ constexpr int kFaultStreams = 4;
 struct Driver;
 
 void service_faults(Driver* self);
+#if defined(__linux__)
+void service_host_faults(Driver* self);
+int open_userfaultfd();
+#endif
 
 // Per-channel producer state, on its own cache line.
 struct alignas(64) Producer {
@@ -190,9 +216,17 @@ struct Driver {
     VramAllocator vram{0, SG_VRAM_SIZE, SG_ALLOC_ALIGN};
     std::list<uint64_t> resident; // managed page VAs in VRAM; CLOCK hand at the front
     std::unordered_map<uint64_t, std::list<uint64_t>::iterator> resident_pos;
-    // Mapped managed ranges, start -> end, so prefetch stays inside the
-    // faulting allocation without the fault thread taking alloc_lock.
-    std::map<uint64_t, uint64_t> managed_ranges;
+    // Mapped managed ranges, device VA start -> end and host base, so
+    // prefetch and the host-fault thread stay inside an allocation without
+    // taking alloc_lock. Host pages are contiguous from `host`.
+    struct ManagedSpan {
+        uint64_t end = 0;
+        uint64_t host = 0;
+    };
+    std::map<uint64_t, ManagedSpan> managed_ranges;
+    // Bounce for UFFDIO_COPY. Callers hold mem_lock. Page-aligned so the
+    // ioctl accepts it as a source.
+    alignas(SG_PAGE_SIZE) uint8_t migrate_bounce[SG_PAGE_SIZE]{};
 
     // Prefetch (fault thread only, apart from the knob).
     uint64_t prefetch_pages = kDefaultPrefetchPages;
@@ -227,9 +261,19 @@ struct Driver {
     std::atomic<uint64_t> submits{0}, stalls{0}, staging_waits{0}, lock_wait_ns{0};
     std::atomic<uint64_t> bytes_h2d{0}, bytes_d2h{0}, bytes_direct{0}, bytes_staged{0};
     std::atomic<uint64_t> migrations{0}, prefetches{0}, evictions{0}, writebacks{0}, bytes_migrated{0};
+    std::atomic<uint64_t> host_faults{0}, host_fault_ns{0};
+    // SG_IOC_UFFD_HOLD. The handler spins on this before mem_lock so a test
+    // can free an allocation while a host thread sits in the kernel fault.
+    // An atomic, not an environment variable: setenv races with getenv.
+    std::atomic<int> uffd_hold{0};
 
     std::atomic<bool> fault_stop{false};
     std::thread fault_th;
+    // userfaultfd, or -1 when two-way coherence is off (SG_UFFD=0, macOS,
+    // or the syscall was refused).
+    int uffd = -1;
+    int uffd_kick = -1;
+    std::thread uffd_th;
 
     Driver() {
         num_engines = dev.num_engines();
@@ -256,13 +300,37 @@ struct Driver {
         dev.set_idle_policy(idle_policy, idle_ns);
         if (const char* e = std::getenv("SG_EXPERIMENT_NO_FENCE")) dev.set_no_fence(*e == '1');
         prefetch_pages = prefetch_from_env();
+#if defined(__linux__)
+        if (const char* e = std::getenv("SG_UFFD"); !(e && e[0] == '0' && e[1] == '\0')) {
+            uffd = open_userfaultfd();
+            if (uffd >= 0) {
+                uffd_kick = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+                if (uffd_kick < 0) {
+                    close(uffd);
+                    uffd = -1;
+                } else {
+                    uffd_th = std::thread(service_host_faults, this);
+                }
+            } else if (std::getenv("SG_TRACE")) {
+                std::fprintf(stderr, "[drv] userfaultfd unavailable: %s\n", std::strerror(errno));
+            }
+        }
+#endif
         fault_th = std::thread(service_faults, this);
     }
 
     ~Driver() {
         fault_stop.store(true, std::memory_order_release);
         dev.fault_irq().signal();
+        if (uffd_kick >= 0) {
+            uint64_t one = 1;
+            ssize_t n = ::write(uffd_kick, &one, sizeof one);
+            (void)n;
+        }
         if (fault_th.joinable()) fault_th.join();
+        if (uffd_th.joinable()) uffd_th.join();
+        if (uffd >= 0) ::close(uffd);
+        if (uffd_kick >= 0) ::close(uffd_kick);
     }
 
     uint8_t* slot_ptr(uint32_t i) { return staging.data() + size_t{i} * chunk; }
@@ -518,6 +586,88 @@ uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd
 
 // ---- managed memory: residency and eviction (caller holds mem_lock) --------
 
+#if defined(__linux__)
+int open_userfaultfd() {
+    // O_NONBLOCK is required: on a blocking userfaultfd, poll() returns
+    // POLLERR and never reports the faults (kernel userfaultfd_poll).
+    int fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+    if (fd < 0) fd = static_cast<int>(syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK));
+    if (fd < 0) return -1;
+    uffdio_api api{};
+    api.api = UFFD_API;
+    if (ioctl(fd, UFFDIO_API, &api) != 0) {
+        int e = errno;
+        ::close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+int uffd_register(Driver& d, void* host, uint64_t bytes) {
+    uffdio_register reg{};
+    reg.range.start = reinterpret_cast<uint64_t>(host);
+    reg.range.len = bytes;
+    reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (ioctl(d.uffd, UFFDIO_REGISTER, &reg) != 0) return -errno;
+    return 0;
+}
+
+void uffd_unregister(Driver& d, void* host, uint64_t bytes) {
+    if (d.uffd < 0 || !host || bytes == 0) return;
+    uffdio_range range{};
+    range.start = reinterpret_cast<uint64_t>(host);
+    range.len = bytes;
+    ioctl(d.uffd, UFFDIO_UNREGISTER, &range);
+}
+
+// Populate one missing host page and wake anyone blocked on it. EEXIST
+// means a racer already did; that copy woke the waiter.
+int uffd_copy_page(Driver& d, uint64_t dst, const void* src) {
+    uffdio_copy cp{};
+    cp.src = reinterpret_cast<uint64_t>(src);
+    cp.dst = dst;
+    cp.len = SG_PAGE_SIZE;
+    if (ioctl(d.uffd, UFFDIO_COPY, &cp) != 0) return errno == EEXIST ? 0 : -errno;
+    if (cp.copy == static_cast<__s64>(SG_PAGE_SIZE)) return 0;
+    const int err = cp.copy < 0 ? static_cast<int>(-cp.copy) : EIO;
+    return err == EEXIST ? 0 : -err;
+}
+
+void uffd_wake(Driver& d, uint64_t dst) {
+    if (d.uffd < 0) return;
+    uffdio_range range{};
+    range.start = dst;
+    range.len = SG_PAGE_SIZE;
+    ioctl(d.uffd, UFFDIO_WAKE, &range);
+}
+#endif
+
+// Install the frame's bytes into the host page. With userfaultfd the host
+// page is missing, so this is UFFDIO_COPY (a memcpy would fault in the
+// caller and deadlock on mem_lock). Without it, only a dirty page is
+// written back; a clean one still has its host copy.
+int publish_host(Driver& d, uint64_t host, uint64_t pa, bool dirty) {
+    if (d.uffd < 0) {
+        if (!dirty) return 0;
+        if (int rc = d.dev.copy_out(pa, reinterpret_cast<void*>(host))) return rc;
+        d.writebacks.fetch_add(1, std::memory_order_relaxed);
+        d.bytes_migrated.fetch_add(SG_PAGE_SIZE, std::memory_order_relaxed);
+        return 0;
+    }
+#if defined(__linux__)
+    if (int rc = d.dev.copy_out(pa, d.migrate_bounce)) return rc;
+    if (int rc = uffd_copy_page(d, host, d.migrate_bounce)) return rc;
+    if (dirty) d.writebacks.fetch_add(1, std::memory_order_relaxed);
+    d.bytes_migrated.fetch_add(SG_PAGE_SIZE, std::memory_order_relaxed);
+    return 0;
+#else
+    (void)host;
+    (void)pa;
+    return -ENOSYS;
+#endif
+}
+
 void forget_resident(Driver& d, uint64_t va) {
     auto it = d.resident_pos.find(va);
     if (it == d.resident_pos.end()) return;
@@ -527,18 +677,23 @@ void forget_resident(Driver& d, uint64_t va) {
 
 // Take one resident managed page out of VRAM and return its frame. The
 // shootdown, then quiesce(), guarantee no engine can still reach the frame
-// through this VA; only then is it written back (if dirty) and reused.
-uint64_t evict_locked(Driver& d, uint64_t va) {
+// through this VA; only then is the host page filled and the frame reused.
+// nullopt leaves the page in VRAM (the publish failed and was rolled back).
+std::optional<uint64_t> evict_locked(Driver& d, uint64_t va) {
     auto& mmu = d.dev.mmu();
     const device::PageInfo pg = mmu.page(va);
     const uint64_t old = mmu.begin_evict(va);
+    if (!(old & device::PTE_IN_VRAM) || pg.host == 0) return std::nullopt;
     d.dev.quiesce();
     const uint64_t late = mmu.end_evict(va);
     const uint64_t pa = device::pte_pa(old);
-    if ((old | late) & device::PTE_DIRTY) {
-        d.dev.copy_out(pa, reinterpret_cast<void*>(pg.host));
-        d.writebacks.fetch_add(1, std::memory_order_relaxed);
-        d.bytes_migrated.fetch_add(SG_PAGE_SIZE, std::memory_order_relaxed);
+    const bool dirty = (old | late) & device::PTE_DIRTY;
+    if (int rc = publish_host(d, pg.host, pa, dirty)) {
+        mmu.make_resident(va, pa);
+        if (std::getenv("SG_TRACE"))
+            std::fprintf(stderr, "[drv] eviction publish failed va=%llx rc=%d\n",
+                         (unsigned long long)va, rc);
+        return std::nullopt;
     }
     d.evictions.fetch_add(1, std::memory_order_relaxed);
     forget_resident(d, va);
@@ -559,7 +714,11 @@ std::optional<uint64_t> evict_one_locked(Driver& d) {
 // Make every managed page host-resident again and return the frames, so
 // an sgMalloc can use them.
 void evict_all_locked(Driver& d) {
-    while (!d.resident.empty()) d.vram.free(evict_locked(d, d.resident.front()));
+    while (!d.resident.empty()) {
+        std::optional<uint64_t> pa = evict_locked(d, d.resident.front());
+        if (!pa) break;
+        d.vram.free(*pa);
+    }
 }
 
 // Migrate one page: take a free frame or evict for one, copy the host
@@ -582,6 +741,14 @@ int migrate_locked(Driver& d, uint64_t va, bool* moved) {
         d.vram.free(*frame);
         return rc;
     }
+    // The host copy is stale the moment the device can write the frame.
+    // Drop it so the next host touch is a missing fault. After the PTE
+    // publish: a failed make_resident never gets here, and the host page
+    // is still populated.
+    if (d.uffd >= 0 && madvise(reinterpret_cast<void*>(pg.host), SG_PAGE_SIZE, MADV_DONTNEED) != 0 &&
+        std::getenv("SG_TRACE"))
+        std::fprintf(stderr, "[drv] MADV_DONTNEED failed va=%llx: %s\n",
+                     (unsigned long long)va, std::strerror(errno));
     d.resident.push_back(va);
     d.resident_pos[va] = std::prev(d.resident.end());
     d.migrations.fetch_add(1, std::memory_order_relaxed);
@@ -624,7 +791,7 @@ uint64_t prefetch_locked(Driver& d, uint64_t va) {
     auto it = d.managed_ranges.upper_bound(va);
     if (it == d.managed_ranges.begin()) return va;
     --it;
-    const uint64_t end = it->second;
+    const uint64_t end = it->second.end;
     const uint64_t capacity = (SG_VRAM_SIZE - d.vram.bytes_live()) / SG_PAGE_SIZE + d.resident.size();
     const uint64_t budget = std::min<uint64_t>(d.prefetch_pages, capacity / 2 > 0 ? capacity / 2 - 1 : 0);
     for (uint64_t i = 0; i < budget && va < end; ++i, va += SG_PAGE_SIZE) {
@@ -658,12 +825,18 @@ void recycle(Driver& d, const Pending& p) {
             }
             mmu.unmap(p.addr, pages);
             for (uint64_t f : frames) d.vram.free(f);
+            // Unregister wakes a thread blocked in a host fault on this
+            // range, then the mapping goes away. The handler may already
+            // hold a fault message; it drops the message when the range
+            // is gone rather than copying into the unmapped address.
+#if defined(__linux__)
+            if (d.uffd >= 0) uffd_unregister(d, p.host, p.size);
+#endif
+            if (d.uffd >= 0) ::munmap(p.host, p.size);
+            else std::free(p.host);
         }
     }
-    if (p.kind == Pending::kManaged) {
-        d.managed_va.free(p.addr);
-        std::free(p.host);
-    }
+    if (p.kind == Pending::kManaged) d.managed_va.free(p.addr);
 }
 
 // Recycle everything the device has finished with. Caller holds alloc_lock.
@@ -884,6 +1057,64 @@ int do_submit(Driver& d, sg_submit_args& a) {
     }
 }
 
+#if defined(__linux__)
+// Device VA of a host address inside some managed allocation, if any.
+// Caller holds mem_lock.
+std::optional<uint64_t> va_for_host(const Driver& d, uint64_t host) {
+    for (const auto& [va, sp] : d.managed_ranges) {
+        const uint64_t bytes = sp.end - va;
+        if (host >= sp.host && host - sp.host < bytes) return va + (host - sp.host);
+    }
+    return std::nullopt;
+}
+
+// Host page faults. Polls the userfaultfd beside an eventfd used only to
+// wake this thread on shutdown. Takes mem_lock, never alloc_lock.
+void service_host_faults(Driver* self) {
+    Driver& d = *self;
+    while (!d.fault_stop.load(std::memory_order_acquire)) {
+        pollfd pf[2] = {{d.uffd, POLLIN, 0}, {d.uffd_kick, POLLIN, 0}};
+        if (poll(pf, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if ((pf[1].revents) || d.fault_stop.load(std::memory_order_acquire)) break;
+        if (!(pf[0].revents & POLLIN)) continue;
+        uffd_msg msg{};
+        const ssize_t nread = ::read(d.uffd, &msg, sizeof msg);
+        if (nread != static_cast<ssize_t>(sizeof msg)) continue; // EAGAIN, or a short read
+        if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
+        const uint64_t host = msg.arg.pagefault.address & ~(SG_PAGE_SIZE - 1);
+        // Count before the test latch so a blocked fault is visible, and
+        // before mem_lock so sgFree can run while this thread spins.
+        d.host_faults.fetch_add(1, std::memory_order_release);
+        if (d.uffd_hold.load(std::memory_order_acquire)) {
+            while (d.uffd_hold.load(std::memory_order_acquire) &&
+                   !d.fault_stop.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            if (d.fault_stop.load(std::memory_order_acquire)) break;
+        }
+        const uint64_t t0 = now_cycles();
+        {
+            std::lock_guard<std::mutex> g(d.mem_lock);
+            const std::optional<uint64_t> va = va_for_host(d, host);
+            if (!va) {
+                uffd_wake(d, host); // range already unregistered
+            } else {
+                const device::PageInfo pg = d.dev.mmu().page(*va);
+                if (pg.kind == device::PageInfo::Vram) {
+                    if (std::optional<uint64_t> pa = evict_locked(d, *va)) d.vram.free(*pa);
+                    else uffd_wake(d, host);
+                } else {
+                    uffd_wake(d, host); // already populated, or a stale message
+                }
+            }
+        }
+        d.host_fault_ns.fetch_add(now_cycles() - t0, std::memory_order_relaxed);
+    }
+}
+#endif
+
 // UVM thread: migrate host-resident pages and unpark the channel that
 // faulted. Takes mem_lock but never alloc_lock — ALLOC can drain while
 // holding alloc_lock, and drain waits for this thread to finish the fault.
@@ -987,7 +1218,7 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         q->submit_mode = d.submit_mode;
         q->spin_ns = d.spin_ns;
         q->idle_policy = d.idle_policy;
-        q->reserved3 = 0;
+        q->uffd = d.uffd >= 0 ? 1u : 0u;
         q->idle_ns = d.idle_ns;
         return 0;
     }
@@ -1052,19 +1283,42 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         const uint64_t pages = (a->size + SG_PAGE_SIZE - 1) / SG_PAGE_SIZE;
         const uint64_t bytes = pages * SG_PAGE_SIZE;
         void* host = nullptr;
-        if (posix_memalign(&host, SG_PAGE_SIZE, bytes) != 0) {
+        if (d.uffd >= 0) {
+            // Populate first, then register: a missing-mode registration
+            // does not fault on pages that already have PTEs, and the
+            // handler is not ready to service faults for a range it has
+            // not recorded yet.
+            host = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (host == MAP_FAILED) {
+                d.managed_va.free(*addr);
+                return -ENOMEM;
+            }
+            std::memset(host, 0, bytes);
+#if defined(__linux__)
+            if (int rc = uffd_register(d, host, bytes)) {
+                ::munmap(host, bytes);
+                d.managed_va.free(*addr);
+                return rc;
+            }
+#endif
+        } else if (posix_memalign(&host, SG_PAGE_SIZE, bytes) != 0) {
             d.managed_va.free(*addr);
             return -ENOMEM;
+        } else {
+            std::memset(host, 0, bytes);
         }
-        std::memset(host, 0, bytes);
         if (int rc = d.dev.mmu().map_host(*addr, reinterpret_cast<uint64_t>(host), pages)) {
-            std::free(host);
+#if defined(__linux__)
+            if (d.uffd >= 0) uffd_unregister(d, host, bytes);
+#endif
+            if (d.uffd >= 0) ::munmap(host, bytes);
+            else std::free(host);
             d.managed_va.free(*addr);
             return rc;
         }
         {
             Guard m(d, d.mem_lock);
-            d.managed_ranges.emplace(*addr, *addr + bytes);
+            d.managed_ranges.emplace(*addr, Driver::ManagedSpan{*addr + bytes, reinterpret_cast<uint64_t>(host)});
         }
         d.allocs.emplace(*addr, Alloc{bytes, host});
         a->addr = *addr;
@@ -1168,14 +1422,20 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         s->evictions = ld(d.evictions);
         s->writebacks = ld(d.writebacks);
         s->bytes_migrated = ld(d.bytes_migrated);
+        s->host_faults = ld(d.host_faults);
+        s->host_fault_ns = ld(d.host_fault_ns);
         return 0;
     }
+    case SG_IOC_UFFD_HOLD:
+        if (!arg) return -EINVAL;
+        d.uffd_hold.store(*static_cast<const int*>(arg) ? 1 : 0, std::memory_order_release);
+        return 0;
     case SG_IOC_RESET_STATS:
         d.dev.reset_stats();
         for (auto* c : {&d.submits, &d.waits, &d.waits_spun, &d.waits_blocked, &d.wake_latency_ns,
                         &d.lock_wait_ns, &d.stalls, &d.staging_waits, &d.bytes_h2d, &d.bytes_d2h,
                         &d.bytes_direct, &d.bytes_staged, &d.migrations, &d.prefetches, &d.evictions,
-                        &d.writebacks, &d.bytes_migrated})
+                        &d.writebacks, &d.bytes_migrated, &d.host_faults, &d.host_fault_ns})
             c->store(0, std::memory_order_relaxed);
         return 0;
     default:
