@@ -11,6 +11,7 @@
 //   fault   - first touch of managed memory (fault + migrate, prefetch)
 //   tlb     - translation cost and TLB reach on resident memory
 //   thrash  - managed working sets larger than the free VRAM frames
+//   fair    - one greedy stream beside a latency-sensitive one (priority, timeslice)
 
 #include <atomic>
 #include <time.h>
@@ -678,6 +679,106 @@ void bench_thrash(const Options& o, Report& rep) {
             die_on(sgFree(d), "sgFree");
         }
     for (sgDevPtr p : held) sgFree(p);
+}
+
+// One engine, two streams. `alone` is the greedy stream by itself.
+// `equal` queues that work and then times small synced probes on a second
+// stream of the same priority: with no timeslice the first probe waits out
+// the backlog. `priority` is the same probe at the highest priority, which
+// preempts at the next command boundary. `pair` runs two equal streams
+// flat out; the gap versus `alone` is the cost of switching.
+void bench_fair(const Options& o, Report& rep) {
+    const int n = o.quick ? 8 : 32;
+    const int probes_n = o.quick ? 4 : 16;
+    const size_t big = 256u << 10;
+    const size_t small = 4096;
+    int least = 0, greatest = 0;
+    sgDeviceGetStreamPriorityRange(&least, &greatest);
+
+    auto destroy = [](sgStream_t s, sgDevPtr p) {
+        if (p) sgFree(p);
+        if (s) sgStreamDestroy(s);
+    };
+
+    {
+        sgStream_t s = nullptr;
+        die_on(sgStreamCreate(&s), "sgStreamCreate");
+        sgDevPtr buf = must_malloc(big);
+        die_on(sgMemsetAsync(buf, 1, big, s), "prime");
+        die_on(sgStreamSynchronize(s), "prime");
+        Window w;
+        w.begin();
+        for (int i = 0; i < n; ++i) die_on(sgMemsetAsync(buf, i & 0xff, big, s), "fill");
+        die_on(sgStreamSynchronize(s), "sync");
+        w.end();
+        Row r{"fair", "alone", {}};
+        r.metrics["greedy_GBps"] = double(big) * n / w.wall_ns();
+        w.fill(r, double(n));
+        rep.rows.push_back(r);
+        destroy(s, buf);
+    }
+
+    if (sgNumChannels() < 2) return;
+
+    auto contended = [&](const char* name, int probe_prio) {
+        sgStream_t probe = nullptr, greedy = nullptr;
+        // The high-priority stream is created first so it can take a free
+        // channel. Creating it second can find every channel already shared.
+        if (probe_prio != least) die_on(sgStreamCreateWithPriority(&probe, probe_prio), "probe");
+        die_on(sgStreamCreate(&greedy), "greedy");
+        if (probe_prio == least) die_on(sgStreamCreate(&probe), "probe");
+        sgDevPtr gbuf = must_malloc(big);
+        sgDevPtr pbuf = must_malloc(small);
+        die_on(sgMemsetAsync(gbuf, 1, big, greedy), "prime");
+        die_on(sgStreamSynchronize(greedy), "prime");
+
+        Window w;
+        w.begin();
+        for (int i = 0; i < n; ++i) die_on(sgMemsetAsync(gbuf, i & 0xff, big, greedy), "greedy");
+        std::vector<double> lat;
+        lat.reserve(size_t(probes_n));
+        for (int i = 0; i < probes_n; ++i) {
+            const auto t0 = Clock::now();
+            die_on(sgMemsetAsync(pbuf, 2, small, probe), "probe");
+            die_on(sgStreamSynchronize(probe), "probe sync");
+            lat.push_back(ns_since(t0));
+        }
+        const double first = lat.front();
+        die_on(sgStreamSynchronize(greedy), "greedy sync");
+        w.end();
+        Row r{"fair", name, {}};
+        r.metrics["probe_first_us"] = first / 1e3;
+        r.metrics["probe_p50_us"] = percentile(lat, 50) / 1e3;
+        r.metrics["probe_max_us"] = percentile(lat, 100) / 1e3;
+        r.metrics["greedy_GBps"] = double(big) * n / w.wall_ns();
+        w.fill(r, double(n + probes_n));
+        rep.rows.push_back(r);
+        destroy(probe, pbuf);
+        destroy(greedy, gbuf);
+    };
+    contended("equal", least);
+    contended("priority", greatest);
+
+    sgStream_t a = nullptr, b = nullptr;
+    die_on(sgStreamCreate(&a), "a");
+    die_on(sgStreamCreate(&b), "b");
+    sgDevPtr ba = must_malloc(big), bb = must_malloc(big);
+    die_on(sgMemsetAsync(ba, 1, big, a), "prime");
+    die_on(sgDeviceSynchronize(), "prime");
+    Window w;
+    w.begin();
+    for (int i = 0; i < n; ++i) {
+        die_on(sgMemsetAsync(ba, i & 0xff, big, a), "a");
+        die_on(sgMemsetAsync(bb, i & 0xff, big, b), "b");
+    }
+    die_on(sgDeviceSynchronize(), "sync");
+    w.end();
+    Row r{"fair", "pair", {}};
+    r.metrics["greedy_GBps"] = double(big) * n * 2 / w.wall_ns();
+    w.fill(r, double(n * 2));
+    rep.rows.push_back(r);
+    destroy(a, ba);
+    destroy(b, bb);
 }
 
 } // namespace bench

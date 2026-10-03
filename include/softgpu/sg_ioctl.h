@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   10u
+#define SG_ABI_VERSION   11u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_PAGE_SIZE     4096ull       /* device page; allocation granularity   */
 #define SG_VA_SIZE       (1ull << 30)  /* device VA space: [0, VRAM) sgMalloc (VA == PA), [VRAM, VA) managed */
@@ -30,10 +30,12 @@ extern "C" {
  * Engines and channels. Engine 0 is the compute engine; engines
  * 1..num_engines-1 are copy engines (DMA). Every engine serves several
  * channels — independent command rings, each with its own fence counter and
- * executed in order — and round-robins between them, skipping a channel
- * whose head is a SG_OP_WAIT_FENCE that is not yet satisfied. That is what
- * lets two streams' work interleave on one engine instead of one stream's
- * semaphore wait blocking everyone behind it in a shared ring.
+ * executed in order. The engine runs the highest-priority runnable channel
+ * (more negative wins; 0 is the default). Equal priorities share the engine
+ * in round-robin visits of SG_TIMESLICE_NS (0 = until the channel blocks or
+ * empties). A channel whose head is an unsatisfied SG_OP_WAIT_FENCE is
+ * skipped, so one stream's semaphore wait does not block another's commands.
+ * Preemption is at command boundaries.
  */
 #define SG_MAX_ENGINES    4u
 #define SG_MAX_CHANNELS   8u
@@ -70,6 +72,15 @@ enum sg_submit_mode { SG_SUBMIT_MUTEX = 0, SG_SUBMIT_TICKET = 1 };
  * the wake-up latency.
  */
 enum sg_idle_policy { SG_IDLE_SPIN = 0, SG_IDLE_SLEEP = 1, SG_IDLE_HYBRID = 2, SG_IDLE_ADAPTIVE = 3 };
+
+/*
+ * Channel priority, CUDA's sign: a smaller value runs first. 0 is the
+ * default and the lowest. SG_TIMESLICE_NS (0 = off) bounds how long equal
+ * priorities keep the engine. Both are read at sgInit; priority is also
+ * programmable per channel (SG_IOC_SET_PRIORITY).
+ */
+#define SG_PRIORITY_LEAST     0
+#define SG_PRIORITY_GREATEST  (-7)
 
 enum sg_opcode {
     SG_OP_NOP        = 0,
@@ -115,6 +126,9 @@ struct sg_query_args {
     uint32_t idle_policy;  /* enum sg_idle_policy in effect */
     uint32_t uffd;         /* 1: host touches of in-VRAM managed pages fault and migrate back */
     uint64_t idle_ns;      /* engine idle budget before sleeping (hybrid; cap for adaptive) */
+    int32_t priority_least;     /* lowest channel priority (inclusive); the default */
+    int32_t priority_greatest;  /* highest channel priority (inclusive); more negative */
+    uint64_t timeslice_ns;      /* 0: a visit runs until the channel blocks or empties */
 };
 
 struct sg_alloc_args {
@@ -195,6 +209,7 @@ struct sg_stats_args {
     uint64_t missed_doorbells[SG_MAX_ENGINES]; /* woke by timeout and found work: a lost wake-up */
     uint64_t cpu_ns[SG_MAX_ENGINES];        /* engine thread CPU time, absolute (never reset) */
     uint64_t faults[SG_MAX_ENGINES];        /* commands parked on a host-resident page */
+    uint64_t preempts[SG_MAX_ENGINES];      /* left a channel that still had work      */
     uint64_t tlb_hits[SG_MAX_ENGINES];      /* page translations served by the TLB      */
     uint64_t tlb_misses[SG_MAX_ENGINES];    /* ... that walked the page table           */
     /* driver-side */
@@ -237,7 +252,18 @@ enum sg_ioc {
     SG_IOC_ALLOC_MANAGED = 0x530A, /* sg_alloc_managed_args  */
     /* Test latch: nonzero makes the host-fault handler wait before mem_lock.
      * int *. Not a device feature. */
-    SG_IOC_UFFD_HOLD     = 0x530B
+    SG_IOC_UFFD_HOLD     = 0x530B,
+    SG_IOC_SET_PRIORITY  = 0x530C  /* sg_priority_args */
+};
+
+/* Program one channel's priority on one engine. Out-of-range values are
+ * rejected (the runtime clamps before it calls). Takes effect at the next
+ * command boundary on that engine. */
+struct sg_priority_args {
+    uint32_t engine;
+    uint32_t channel;
+    int32_t priority;
+    uint32_t reserved;
 };
 
 #ifdef __cplusplus

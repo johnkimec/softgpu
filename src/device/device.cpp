@@ -92,9 +92,24 @@ void Device::reset_stats() {
         st.wakeups.store(0, std::memory_order_relaxed);
         st.missed_doorbells.store(0, std::memory_order_relaxed);
         st.faults.store(0, std::memory_order_relaxed);
+        st.preempts.store(0, std::memory_order_relaxed);
         st.stats_gen.fetch_add(1, std::memory_order_release);
     }
     mmu_.reset_stats();
+}
+
+int Device::set_channel_priority(uint32_t engine, uint32_t channel, int32_t priority) {
+    if (engine >= num_engines_ || channel >= num_channels_) return -EINVAL;
+    if (priority > SG_PRIORITY_LEAST || priority < SG_PRIORITY_GREATEST) return -EINVAL;
+    ch_[engine][channel].priority.store(priority, std::memory_order_relaxed);
+    bool mixed = false;
+    for (uint32_t e = 0; e < num_engines_ && !mixed; ++e)
+        for (uint32_t c = 0; c < num_channels_; ++c)
+            if (ch_[e][c].priority.load(std::memory_order_relaxed) != SG_PRIORITY_LEAST) mixed = true;
+    // Release pairs with the run loop's acquire: the priority stores above
+    // are visible once an engine observes mixed == true.
+    mixed_priority_.store(mixed, std::memory_order_release);
+    return 0;
 }
 
 void Device::push_fault(const Fault& f) {
@@ -195,10 +210,13 @@ int Device::for_runs(uint32_t engine, Replay& r, uint64_t va, uint64_t len, bool
     return 0;
 }
 
-// One engine's loop: a runlist over its channels. Each round visits every
-// channel with published work and runs it until it empties or its head is a
-// WAIT_FENCE that is not yet satisfied — then moves on rather than blocking,
-// so one stream's semaphore never stalls another stream's commands.
+// One engine's loop: a runlist over its channels. Each visit runs the
+// highest-priority channel that can execute (a WAIT_FENCE whose target has
+// not passed is skipped, so one stream's semaphore never stalls another
+// stream's commands). Equal priorities are round-robin. A visit ends at a
+// command boundary when the timeslice expires and someone else can run, or
+// when a strictly higher-priority channel becomes runnable. A lone channel
+// is not sliced: there is nothing to switch to.
 //
 // STAGE 7: when no round has made progress for longer than the idle budget
 // the engine power-gates: it marks itself asleep, re-checks every channel
@@ -229,22 +247,44 @@ void Device::run(uint32_t engine) {
     bool woke = false; // the previous round ended a sleep that was signalled
     uint64_t aseq = access_[engine].v.load(std::memory_order_relaxed);
     st.cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
+    uint32_t rr = 0; // next equal-priority channel to prefer
+
+    // Head command cannot execute yet: a WAIT whose target fence has not passed.
+    // An out-of-range WAIT is runnable so the visit can retire it as -EINVAL.
+    auto wait_blocked = [&](const sg_cmd& cmd) {
+        return cmd.opcode == SG_OP_WAIT_FENCE && cmd.arg0 < num_engines_ && cmd.arg1 < num_channels_ &&
+               ch_[cmd.arg0][cmd.arg1].get.load(std::memory_order_acquire) < cmd.src1;
+    };
+    // Another channel can execute now, and its priority compares as asked.
+    // `better` selects a strictly higher priority (smaller value); otherwise
+    // only the same priority, which is who a timeslice yields to.
+    auto other_runnable = [&](uint32_t self, int32_t self_prio, bool better) {
+        for (uint32_t c = 0; c < num_channels_; ++c) {
+            if (c == self) continue;
+            Channel& o = ch_[engine][c];
+            const int32_t prio = o.priority.load(std::memory_order_relaxed);
+            if (better ? prio >= self_prio : prio != self_prio) continue;
+            if (o.parked.load(std::memory_order_acquire)) continue;
+            const uint64_t put = o.put.load(std::memory_order_acquire);
+            if (put <= cur[c].get) continue;
+            if (wait_blocked(cur[c].ring[cur[c].get & cur[c].mask])) continue;
+            return true;
+        }
+        return false;
+    };
 
     while (running_.load(std::memory_order_relaxed)) {
         bool progress = false, pending = false;
-        for (uint32_t c = 0; c < num_channels_; ++c) {
+        int chosen = -1;
+        int32_t chosen_prio = 0;
+        for (uint32_t i = 0; i < num_channels_; ++i) {
+            const uint32_t c = (rr + i) % num_channels_;
             Channel& ch = ch_[engine][c];
             Cursor& k = cur[c];
             // Acquire pairs with the driver's release store of `put` and
             // makes every slot below it visible to this thread.
             uint64_t put = ch.put.load(std::memory_order_acquire);
             seen_put[c] = put;
-            if (ch.parked.load(std::memory_order_acquire)) {
-                // Head command is waiting on a migration. Other channels
-                // still run. Unpark rings the doorbell if we sleep.
-                if (put != k.get) pending = true;
-                continue;
-            }
             const int32_t fail = ch.fault_fail.exchange(0, std::memory_order_acquire);
             if (fail != 0) {
                 int expected = 0;
@@ -266,6 +306,12 @@ void Device::run(uint32_t engine) {
                 }
                 continue;
             }
+            if (ch.parked.load(std::memory_order_acquire)) {
+                // Head command is waiting on a migration. Other channels
+                // still run. Unpark rings the doorbell if we sleep.
+                if (put != k.get) pending = true;
+                continue;
+            }
             if (put == k.get) continue;
             if (put < k.get) {
                 // PUT behind GET is a driver bug (a doorbell went backwards).
@@ -276,7 +322,28 @@ void Device::run(uint32_t engine) {
                 if (std::getenv("SG_TRACE")) std::fprintf(stderr, "[dev] engine %u ch %u PUT %llu < GET %llu\n", engine, c, (unsigned long long)put, (unsigned long long)k.get);
                 continue;
             }
+            if (wait_blocked(k.ring[k.get & k.mask])) {
+                pending = true;
+                continue;
+            }
             pending = true;
+            const int32_t prio = ch.priority.load(std::memory_order_relaxed);
+            // Smaller priority value wins. The scan starts at `rr`, so the
+            // first channel of the winning priority is the round-robin one.
+            if (chosen < 0 || prio < chosen_prio) {
+                chosen = int(c);
+                chosen_prio = prio;
+            }
+        }
+
+        bool retired = false;
+        if (chosen >= 0) {
+            const uint32_t c = uint32_t(chosen);
+            rr = (c + 1) % num_channels_;
+            Channel& ch = ch_[engine][c];
+            Cursor& k = cur[c];
+            uint64_t put = seen_put[c];
+            uint64_t slice_start = now_cycles();
             while (k.get != put) {
                 const sg_cmd& cmd = k.ring[k.get & k.mask];
                 int rc = 0;
@@ -286,7 +353,7 @@ void Device::run(uint32_t engine) {
                     // earlier (ADR 003).
                     if (cmd.arg0 >= num_engines_ || cmd.arg1 >= num_channels_) {
                         rc = -EINVAL;
-                    } else if (ch_[cmd.arg0][cmd.arg1].get.load(std::memory_order_acquire) < cmd.src1) {
+                    } else if (wait_blocked(cmd)) {
                         break; // blocked: leave this channel for now
                     }
                 } else {
@@ -315,7 +382,7 @@ void Device::run(uint32_t engine) {
                     if (std::getenv("SG_TRACE")) std::fprintf(stderr, "[dev] engine %u ch %u cmd#%llu opcode %u rc %d\n", engine, c, (unsigned long long)k.get, cmd.opcode, rc);
                 }
                 ++k.get;
-                progress = true;
+                retired = true;
                 st.cmds_executed.fetch_add(1, std::memory_order_relaxed);
                 // Retire each command individually (release publishes its
                 // results) so a host or another channel waiting on an early
@@ -337,8 +404,33 @@ void Device::run(uint32_t engine) {
                     irq_.signal();
                 }
                 if (k.get == put) put = ch.put.load(std::memory_order_acquire);
+                if (k.get == put) break;
+                // Command boundary. A higher priority preempts immediately.
+                // The timeslice yields only to an equal priority; a lower one
+                // waits, and a lone channel restarts its slice instead of
+                // switching to nobody.
+                const bool mixed = mixed_priority_.load(std::memory_order_acquire);
+                const bool slice_due = timeslice_ns_ != 0 && now_cycles() - slice_start >= timeslice_ns_;
+                if (mixed || slice_due) {
+                    const int32_t self = ch.priority.load(std::memory_order_relaxed);
+                    if (mixed && other_runnable(c, self, true)) {
+                        st.preempts.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    if (slice_due) {
+                        if (other_runnable(c, self, false)) {
+                            st.preempts.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+                        slice_start = now_cycles();
+                    }
+                }
             }
         }
+        if (retired) progress = true;
+        // Faulted before retiring anything, and no sibling was retired via
+        // fault_fail either: look again so another channel runs before sleep.
+        if (chosen >= 0 && !retired && !progress) continue;
 
         const uint64_t now = now_cycles();
         // Keep the CPU-time export fresh (about once a millisecond, busy or

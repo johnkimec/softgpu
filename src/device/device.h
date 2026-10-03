@@ -22,9 +22,14 @@
 // STAGE 3b: several engines, each serving several channels. Engine 0 is
 // the compute engine (FILL, VADD, GEMM); engines 1.. are copy engines
 // (COPY_*). A channel is a ring with its own PUT/GET and fence, executed in
-// order. An engine round-robins its channels (a "runlist") and skips a
-// channel whose head is a SG_OP_WAIT_FENCE that is not yet satisfied — the
+// order. An engine's runlist runs the highest-priority runnable channel and
+// skips one whose head is a SG_OP_WAIT_FENCE that is not yet satisfied — the
 // semaphore acquire blocks that channel, not the engine.
+//
+// STAGE 6: priority and timeslice. A channel's `priority` uses CUDA's sign
+// (more negative runs first; 0 is the default). Equal priorities take
+// turns of `timeslice_ns` (0 = run until the channel blocks or empties).
+// The engine yields at a command boundary, never in the middle of one.
 
 #include <atomic>
 #include <cstdint>
@@ -80,6 +85,9 @@ struct alignas(64) Channel {
     // engine retires the command instead of faulting forever.
     alignas(64) std::atomic<bool> parked{false};
     std::atomic<int32_t> fault_fail{0};
+    // CUDA sign: smaller runs first. 0 is the default and the lowest.
+    // The driver writes it; the engine reads it at command boundaries.
+    std::atomic<int32_t> priority{0};
 };
 
 // One engine's telemetry (the engine thread accounts across its channels).
@@ -95,6 +103,7 @@ struct alignas(64) EngineStats {
     std::atomic<uint64_t> missed_doorbells{0}; // timeout wake that found work waiting
     std::atomic<uint64_t> cpu_ns{0};           // this engine thread's CPU time (absolute)
     std::atomic<uint64_t> faults{0};           // commands parked on a host-resident page
+    std::atomic<uint64_t> preempts{0};         // left a channel that still had commands queued
     std::atomic<uint32_t> stats_gen{0}; // bumped by reset_stats(); engine restarts its idle timer
 };
 
@@ -146,6 +155,11 @@ public:
 
     // Idle gating policy; set before power_on().
     void set_idle_policy(uint32_t policy, uint64_t idle_ns) { idle_policy_ = policy; idle_ns_ = idle_ns; }
+    // 0: a visit runs until the channel blocks or empties. Set before power_on().
+    void set_timeslice_ns(uint64_t ns) { timeslice_ns_ = ns; }
+    // Out-of-range priority returns -EINVAL. Visible to the engine at its
+    // next command boundary.
+    int set_channel_priority(uint32_t engine, uint32_t channel, int32_t priority);
 
     // Bring the engines up / down. power_off() blocks until every engine
     // thread has exited; commands in flight are completed first. `cpu` >= 0
@@ -221,6 +235,10 @@ private:
     std::atomic<uint32_t> num_asleep_blocked_{0};
     uint32_t idle_policy_ = SG_IDLE_HYBRID;
     uint64_t idle_ns_ = 50000;
+    uint64_t timeslice_ns_ = 0;
+    // True once any channel priority is not the default. The run loop
+    // skips the priority scan while this is false.
+    std::atomic<bool> mixed_priority_{false};
     bool no_fence_ = false;
     uint32_t num_engines_;
     uint32_t num_channels_;

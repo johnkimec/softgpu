@@ -55,9 +55,101 @@ int g_managed_coherent = 0;
 uint32_t g_num_engines = 1;
 uint32_t g_num_ce = 0;
 uint32_t g_num_channels = 1;
+int g_prio_least = SG_PRIORITY_LEAST;
+int g_prio_greatest = SG_PRIORITY_GREATEST;
+uint64_t g_timeslice_ns = 0;
 std::atomic<uint32_t> g_sync_flags{SG_WAIT_DEFAULT}; // from sgSetSyncPolicy
 std::atomic<uint32_t> g_next_stream_id{1};
 sgStream g_default_stream; // NULL maps here; id 0
+
+// Which priority each channel index is programmed to, and how many streams
+// use it. The same index is used on every engine. The default stream holds
+// channel 0 at priority 0 for the life of the context, so a higher-priority
+// stream takes a different channel and the two can be scheduled apart.
+struct ChanBind {
+    int priority = 0;
+    int users = 0;
+};
+std::mutex g_bind_mu;
+ChanBind g_bind[SG_MAX_CHANNELS];
+
+sgError_t from_errno(int rc);
+
+int clamp_priority(int priority) {
+    if (priority < g_prio_greatest) return g_prio_greatest;
+    if (priority > g_prio_least) return g_prio_least;
+    return priority;
+}
+
+int set_priority_all(uint32_t channel, int priority) {
+    for (uint32_t e = 0; e < g_num_engines; ++e) {
+        sg_priority_args a{};
+        a.engine = e;
+        a.channel = channel;
+        a.priority = priority;
+        if (int rc = sg_drv_ioctl(g_fd, SG_IOC_SET_PRIORITY, &a)) return rc;
+    }
+    return 0;
+}
+
+// Caller holds g_bind_mu. On success the stream's channel is set and that
+// slot's user count is incremented.
+sgError_t bind_channel(sgStream* s, int priority) {
+    int found = -1;
+    int best_users = 0;
+    for (uint32_t c = 0; c < g_num_channels; ++c) {
+        if (g_bind[c].priority != priority) continue;
+        if (found < 0 || g_bind[c].users < best_users) {
+            found = int(c);
+            best_users = g_bind[c].users;
+        }
+    }
+    if (found < 0) {
+        for (uint32_t c = 0; c < g_num_channels; ++c) {
+            if (g_bind[c].users == 0) {
+                found = int(c);
+                break;
+            }
+        }
+        if (found < 0) return SG_ERR_INVALID_VALUE;
+        if (int rc = set_priority_all(uint32_t(found), priority)) {
+            set_priority_all(uint32_t(found), SG_PRIORITY_LEAST);
+            return from_errno(rc);
+        }
+        g_bind[found].priority = priority;
+    }
+    g_bind[found].users++;
+    s->channel = uint32_t(found);
+    return SG_OK;
+}
+
+void unbind_channel(sgStream* s) {
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    ChanBind& slot = g_bind[s->channel];
+    if (slot.users > 0) slot.users--;
+    if (slot.users == 0 && slot.priority != SG_PRIORITY_LEAST) {
+        // In-flight commands stay on the ring; they drop to the default
+        // priority, which is the only one left that can claim this channel.
+        if (set_priority_all(s->channel, SG_PRIORITY_LEAST) == 0) slot.priority = SG_PRIORITY_LEAST;
+    }
+}
+
+sgError_t create_stream(sgStream_t* out, int priority) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!out) return SG_ERR_INVALID_VALUE;
+    auto* s = new sgStream();
+    s->id = g_next_stream_id.fetch_add(1, std::memory_order_relaxed);
+    // Spread copies across copy engines. The channel is chosen separately
+    // so two priorities never have to share a ring.
+    s->ce = g_num_ce ? 1 + (s->id % g_num_ce) : 0;
+    std::lock_guard<std::mutex> g(g_bind_mu);
+    if (sgError_t e = bind_channel(s, clamp_priority(priority))) {
+        delete s;
+        return e;
+    }
+    *out = s;
+    return SG_OK;
+}
 
 sgError_t from_errno(int rc) {
     switch (rc) {
@@ -169,8 +261,14 @@ sgError_t sgInit(void) {
     g_num_engines = q.num_engines;
     g_num_ce = q.num_engines - 1;
     g_num_channels = q.num_channels;
+    g_prio_least = q.priority_least;
+    g_prio_greatest = q.priority_greatest;
+    g_timeslice_ns = q.timeslice_ns;
     {
-        std::lock_guard<std::mutex> g(g_default_stream.m);
+        std::lock_guard<std::mutex> g(g_bind_mu);
+        for (uint32_t c = 0; c < SG_MAX_CHANNELS; ++c) g_bind[c] = {};
+        g_bind[0].users = 1; // the default stream
+        std::lock_guard<std::mutex> d(g_default_stream.m);
         g_default_stream.has_tail = false;
         g_default_stream.extra_waits.clear();
         g_default_stream.ce = g_num_ce ? 1 : 0;
@@ -279,24 +377,26 @@ sgError_t sgHostUnregister(void* ptr) {
 
 // ---- streams and events ------------------------------------------------
 
-sgError_t sgStreamCreate(sgStream_t* out) {
-    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
-    if (!out) return SG_ERR_INVALID_VALUE;
-    auto* s = new sgStream();
-    s->id = g_next_stream_id.fetch_add(1, std::memory_order_relaxed);
-    // Spread streams across copy engines so independent streams' copies can
-    // overlap each other as well as compute, and across channels so one
-    // stream's semaphore wait does not block another's commands.
-    s->ce = g_num_ce ? 1 + (s->id % g_num_ce) : 0;
-    s->channel = s->id % g_num_channels;
-    *out = s;
-    return SG_OK;
+sgError_t sgStreamCreate(sgStream_t* out) { return create_stream(out, SG_PRIORITY_LEAST); }
+
+sgError_t sgStreamCreateWithPriority(sgStream_t* out, int priority) {
+    return create_stream(out, priority);
 }
+
+void sgDeviceGetStreamPriorityRange(int* least, int* greatest) {
+    if (least) *least = g_fd >= 0 ? g_prio_least : 0;
+    if (greatest) *greatest = g_fd >= 0 ? g_prio_greatest : 0;
+}
+
+uint64_t sgTimesliceNs(void) { return g_fd >= 0 ? g_timeslice_ns : 0; }
+
+uint32_t sgNumChannels(void) { return g_fd >= 0 ? g_num_channels : 0; }
 
 sgError_t sgStreamDestroy(sgStream_t stream) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     if (!stream) return SG_ERR_INVALID_VALUE;
-    delete stream; // in-flight commands do not reference the object
+    unbind_channel(stream); // in-flight commands do not reference the object
+    delete stream;
     return SG_OK;
 }
 
@@ -502,6 +602,7 @@ sgError_t sgGetStats(sgStats_t* out) {
             out->engine_missed_doorbells[e] = s.missed_doorbells[e];
             out->engine_cpu_ns[e] = s.cpu_ns[e];
             out->engine_faults[e] = s.faults[e];
+            out->engine_preempts[e] = s.preempts[e];
             out->engine_tlb_hits[e] = s.tlb_hits[e];
             out->engine_tlb_misses[e] = s.tlb_misses[e];
         }

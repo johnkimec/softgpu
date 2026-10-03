@@ -87,4 +87,8 @@ set_tests_properties(runtime_prefetch0 PROPERTIES ENVIRONMENT "SG_PREFETCH_PAGES
 # One-way managed memory: host writes after the first device touch stay stale.
 add_test(NAME runtime_uffd0 COMMAND sgtest)
 set_tests_properties(runtime_uffd0 PROPERTIES ENVIRONMENT "SG_UFFD=0")
+# Equal-priority timeslice: a visit yields after 20 us when another channel
+# of the same priority can run.
+add_test(NAME runtime_slice COMMAND sgtest)
+set_tests_properties(runtime_slice PROPERTIES ENVIRONMENT "SG_TIMESLICE_NS=20000" TIMEOUT 180)
 set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 runtime_prefetch0 runtime_uffd0 PROPERTIES TIMEOUT 120)

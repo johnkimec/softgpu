@@ -133,6 +133,7 @@ struct Window {
     double bytes_migrated() const { return double(s1.um_bytes_migrated - s0.um_bytes_migrated); }
     double host_faults() const { return double(s1.um_host_faults - s0.um_host_faults); }
     double host_fault_ns() const { return double(s1.um_host_fault_ns - s0.um_host_fault_ns); }
+    double preempts() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_preempts[e] - s0.engine_preempts[e]); return n; }
 
     // Fill the standard metrics every benchmark reports.
     void fill(Row& r, double ops) const {
@@ -185,6 +186,7 @@ struct Window {
             r.metrics["host_faults_per_op"] = host_faults() / ops;
             r.metrics["host_fault_us"] = host_fault_ns() / host_faults() / 1e3;
         }
+        if (preempts() > 0) r.metrics["preempts_per_op"] = preempts() / ops;
     }
 };
 
@@ -211,5 +213,6 @@ void bench_wake(const Options&, Report&);
 void bench_fault(const Options&, Report&);
 void bench_tlb(const Options&, Report&);
 void bench_thrash(const Options&, Report&);
+void bench_fair(const Options&, Report&);
 
 } // namespace bench

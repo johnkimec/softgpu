@@ -1388,6 +1388,132 @@ static void test_tlb_reach() {
     }
 }
 
+// Priority range, and a priority the device cannot host (every channel
+// already taken) is rejected rather than silently shared.
+static void test_priority_range() {
+    int least = 1, greatest = 1;
+    sgDeviceGetStreamPriorityRange(&least, &greatest);
+    CHECK(least == 0);
+    CHECK(greatest < least);
+    sgStream_t s = nullptr;
+    CHECK_OK(sgStreamCreateWithPriority(&s, 100)); // clamps up to `least`
+    CHECK_OK(sgStreamDestroy(s));
+    sgError_t e = sgStreamCreateWithPriority(&s, -100); // clamps down to `greatest`
+    if (sgNumChannels() < 2) {
+        CHECK(e == SG_ERR_INVALID_VALUE);
+    } else {
+        CHECK_OK(e);
+        CHECK_OK(sgStreamDestroy(s));
+    }
+}
+
+// A low-priority stream keeps its ring full. A high-priority memset must
+// finish anyway: the engine preempts at the next command boundary. If it
+// did not, this sync would wait until the flood stopped, which it never
+// does on its own.
+static void test_priority_preempts() {
+    if (sgNumChannels() < 2) return;
+    int least = 0, greatest = 0;
+    sgDeviceGetStreamPriorityRange(&least, &greatest);
+    sgStream_t hi = nullptr, lo = nullptr;
+    CHECK_OK(sgStreamCreateWithPriority(&hi, greatest));
+    CHECK_OK(sgStreamCreate(&lo));
+
+    constexpr size_t kBytes = 4u << 20;
+    sgDevPtr big = 0, small = 0;
+    CHECK_OK(sgMalloc(&big, kBytes));
+    CHECK_OK(sgMalloc(&small, 4096));
+
+    std::atomic<int> stop{0};
+    std::atomic<int> flooding{1};
+    std::thread flood([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (sgMemsetAsync(big, 1, kBytes, lo) != SG_OK) break;
+        }
+        flooding.store(0, std::memory_order_relaxed);
+    });
+
+    // Reset first. An earlier test may have stalled, and a leftover counter
+    // would make the wait below return before this flood has a backlog.
+    CHECK_OK(sgResetStats());
+    bool saw = false;
+    for (int spin = 0; spin < 10000000 && !saw; ++spin) {
+        sgStats_t s{};
+        // A stalled submit means the low ring is full and the engine is in it.
+        if (sgGetStats(&s) == SG_OK && s.driver_stalls > 0) saw = true;
+        else std::this_thread::yield();
+    }
+    CHECK(saw);
+    CHECK_OK(sgMemsetAsync(small, 0x5a, 4096, hi));
+    CHECK_OK(sgStreamSynchronize(hi));
+    sgStats_t mid{};
+    CHECK_OK(sgGetStats(&mid));
+    // The sync returned while the flood was still in its loop. If the engine
+    // never left the low-priority channel, this sync would still be waiting.
+    CHECK(flooding.load(std::memory_order_relaxed) == 1);
+    // A 2-deep ring can drain in the gap between noticing the stall and
+    // submitting, so the high channel is scheduled with the low one empty
+    // and no preemption is counted. A deep ring still has a backlog.
+    const char* depth = std::getenv("SG_RING_DEPTH");
+    const bool shallow = depth && std::atoi(depth) > 0 && std::atoi(depth) < 32;
+    if (!shallow) CHECK(mid.engine_preempts[0] >= 1);
+    stop.store(1, std::memory_order_relaxed);
+    flood.join();
+    CHECK_OK(sgStreamSynchronize(lo));
+
+    std::vector<uint8_t> got(4096, 0);
+    CHECK_OK(sgMemcpyD2H(got.data(), small, got.size()));
+    CHECK(got[0] == 0x5a && got.back() == 0x5a);
+
+    CHECK_OK(sgFree(big));
+    CHECK_OK(sgFree(small));
+    CHECK_OK(sgStreamDestroy(hi));
+    CHECK_OK(sgStreamDestroy(lo));
+}
+
+// Same shape as the priority test, for two streams of equal priority.
+// Only meaningful when a timeslice is configured; otherwise the flood
+// would hold the engine until it stopped.
+static void test_timeslice_interleaves() {
+    if (sgTimesliceNs() == 0 || sgNumChannels() < 2) return;
+    sgStream_t a = nullptr, b = nullptr;
+    CHECK_OK(sgStreamCreate(&a));
+    CHECK_OK(sgStreamCreate(&b));
+
+    constexpr size_t kBytes = 1u << 20;
+    sgDevPtr big = 0, small = 0;
+    CHECK_OK(sgMalloc(&big, kBytes));
+    CHECK_OK(sgMalloc(&small, 4096));
+
+    std::atomic<int> stop{0};
+    std::thread flood([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (sgMemsetAsync(big, 1, kBytes, a) != SG_OK) break;
+        }
+    });
+    CHECK_OK(sgResetStats());
+    bool saw = false;
+    for (int spin = 0; spin < 10000000 && !saw; ++spin) {
+        sgStats_t s{};
+        if (sgGetStats(&s) == SG_OK && s.driver_stalls > 0) saw = true;
+        else std::this_thread::yield();
+    }
+    CHECK(saw);
+    CHECK_OK(sgMemsetAsync(small, 0x11, 4096, b));
+    CHECK_OK(sgStreamSynchronize(b));
+    sgStats_t mid{};
+    CHECK_OK(sgGetStats(&mid));
+    stop.store(1, std::memory_order_relaxed);
+    flood.join();
+    CHECK_OK(sgStreamSynchronize(a));
+    CHECK(mid.engine_preempts[0] >= 1);
+
+    CHECK_OK(sgFree(big));
+    CHECK_OK(sgFree(small));
+    CHECK_OK(sgStreamDestroy(a));
+    CHECK_OK(sgStreamDestroy(b));
+}
+
 int main() {
     CHECK(sgInit() == SG_OK);
     CHECK(sgInit() == SG_ERR_ALREADY_INITIALIZED);
@@ -1437,6 +1563,9 @@ int main() {
         {"managed_host_other_page", test_managed_host_other_page},
         {"managed_free_during_host_fault", test_managed_free_during_host_fault},
         {"tlb_reach", test_tlb_reach},
+        {"priority_range", test_priority_range},
+        {"priority_preempts", test_priority_preempts},
+        {"timeslice_interleaves", test_timeslice_interleaves},
     };
     for (auto& t : tests) {
         int before = g_failures;

@@ -129,6 +129,9 @@ uint32_t submit_mode_from_env() {
 }
 constexpr uint64_t kDefaultPrefetchPages = 16; // ADR 007 slice 4; 0 disables
 uint64_t prefetch_from_env() { return env_int("SG_PREFETCH_PAGES", kDefaultPrefetchPages, 0, 4096); }
+// 0: a channel runs until it blocks or empties (ADR 008). A positive value
+// is the equal-priority timeslice, in device nanoseconds.
+uint64_t timeslice_from_env() { return env_int("SG_TIMESLICE_NS", 0, 0, 10000000000ull); }
 // SG_DEVICE_CPU=<n> pins the compute engine's thread; -1 (default) leaves it to the OS.
 int device_cpu_from_env() {
     const char* e = std::getenv("SG_DEVICE_CPU");
@@ -253,6 +256,7 @@ struct Driver {
     uint64_t spin_ns = kDefaultSpinNs;
     uint32_t idle_policy = SG_IDLE_HYBRID;
     uint64_t idle_ns = 50000;
+    uint64_t timeslice_ns = 0;
     std::atomic<uint64_t> ewma[SG_MAX_ENGINES][SG_MAX_CHANNELS] = {};
     std::atomic<uint64_t> ewma_all{0};
 
@@ -298,6 +302,8 @@ struct Driver {
         idle_policy = idle_policy_from_env();
         idle_ns = idle_ns_from_env();
         dev.set_idle_policy(idle_policy, idle_ns);
+        timeslice_ns = timeslice_from_env();
+        dev.set_timeslice_ns(timeslice_ns);
         if (const char* e = std::getenv("SG_EXPERIMENT_NO_FENCE")) dev.set_no_fence(*e == '1');
         prefetch_pages = prefetch_from_env();
 #if defined(__linux__)
@@ -1220,6 +1226,9 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         q->idle_policy = d.idle_policy;
         q->uffd = d.uffd >= 0 ? 1u : 0u;
         q->idle_ns = d.idle_ns;
+        q->priority_least = SG_PRIORITY_LEAST;
+        q->priority_greatest = SG_PRIORITY_GREATEST;
+        q->timeslice_ns = d.timeslice_ns;
         return 0;
     }
     case SG_IOC_ALLOC: {
@@ -1401,6 +1410,7 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             s->missed_doorbells[e] = st.missed_doorbells.load(std::memory_order_relaxed);
             s->cpu_ns[e] = st.cpu_ns.load(std::memory_order_relaxed);
             s->faults[e] = st.faults.load(std::memory_order_relaxed);
+            s->preempts[e] = st.preempts.load(std::memory_order_relaxed);
             s->tlb_hits[e] = d.dev.mmu().tlb_hits(e);
             s->tlb_misses[e] = d.dev.mmu().tlb_misses(e);
         }
@@ -1425,6 +1435,11 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         s->host_faults = ld(d.host_faults);
         s->host_fault_ns = ld(d.host_fault_ns);
         return 0;
+    }
+    case SG_IOC_SET_PRIORITY: {
+        if (!arg) return -EINVAL;
+        auto* p = static_cast<sg_priority_args*>(arg);
+        return d.dev.set_channel_priority(p->engine, p->channel, p->priority);
     }
     case SG_IOC_UFFD_HOLD:
         if (!arg) return -EINVAL;

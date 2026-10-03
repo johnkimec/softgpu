@@ -56,6 +56,7 @@ typedef struct sgStats {
     uint64_t engine_missed_doorbells[SG_MAX_ENGINES_RT];
     uint64_t engine_cpu_ns[SG_MAX_ENGINES_RT];       /* engine thread CPU, absolute */
     uint64_t engine_faults[SG_MAX_ENGINES_RT];       /* page faults (managed memory) */
+    uint64_t engine_preempts[SG_MAX_ENGINES_RT];     /* left a channel that still had work */
     uint64_t engine_tlb_hits[SG_MAX_ENGINES_RT];
     uint64_t engine_tlb_misses[SG_MAX_ENGINES_RT];
     uint64_t driver_submits;
@@ -115,9 +116,23 @@ sgError_t sgFreeHost(void* ptr);
 sgError_t sgHostRegister(void* ptr, size_t bytes);
 sgError_t sgHostUnregister(void* ptr);
 
-/* Streams and events. Destroying a stream or event does not wait for work. */
+/* Streams and events. Destroying a stream or event does not wait for work.
+ *
+ * Priority uses CUDA's sign: a smaller value runs first, and 0 is the
+ * default (also the lowest). Values outside the range from
+ * sgDeviceGetStreamPriorityRange are clamped. A priority other than 0 needs
+ * a channel that is free or already at that priority; if every channel is
+ * already in use at a different priority, sgStreamCreateWithPriority returns
+ * SG_ERR_INVALID_VALUE. Equal priorities share a channel's ring and cannot
+ * preempt each other. SG_TIMESLICE_NS (sgTimesliceNs; 0 = off) is how long
+ * equal priorities keep an engine before it switches, at a command boundary.
+ */
 sgError_t sgStreamCreate(sgStream_t* out);
+sgError_t sgStreamCreateWithPriority(sgStream_t* out, int priority);
 sgError_t sgStreamDestroy(sgStream_t stream);
+void sgDeviceGetStreamPriorityRange(int* least, int* greatest);
+uint64_t sgTimesliceNs(void);
+uint32_t sgNumChannels(void);
 sgError_t sgStreamSynchronize(sgStream_t stream); /* host waits for this stream's work */
 sgError_t sgEventCreate(sgEvent_t* out);
 sgError_t sgEventDestroy(sgEvent_t event);
