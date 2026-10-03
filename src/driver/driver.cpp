@@ -6,8 +6,18 @@
 // lock either.
 //
 // Lock order, where two are ever held: pin_lock -> alloc_lock (UNPIN pushes
-// onto the pending list). Channel locks nest inside nothing and nothing
-// nests inside them except the staging lock (briefly, for slot bookkeeping).
+// onto the pending list), alloc_lock -> mem_lock (allocation and recycling
+// touch frames). Channel locks nest inside nothing and nothing nests inside
+// them except the staging lock (briefly, for slot bookkeeping). The fault
+// thread takes mem_lock only: ALLOC drains while holding alloc_lock, and
+// the drain may be waiting on a fault.
+//
+// STAGE 5: two address spaces. Device VAs [0, VRAM) are sgMalloc, mapped
+// VA == PA and resident for life; [VRAM, SG_VA_SIZE) are managed. VRAM
+// frames come from one allocator: sgMalloc takes contiguous blocks, a
+// managed page takes one frame when it faults in and gives it back when it
+// is evicted (CLOCK over resident managed pages) or freed. A fault that
+// continues a channel's sequential walk also prefetches the next pages.
 //
 // STAGE 2: interrupts and a wait policy. Every place the host waits for a
 // fence goes through wait_until(): spin for a budget, then arm the channel's
@@ -30,9 +40,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -93,6 +105,8 @@ uint32_t submit_mode_from_env() {
     const char* e = std::getenv("SG_SUBMIT_MODE");
     return (e && !std::strcmp(e, "ticket")) ? SG_SUBMIT_TICKET : SG_SUBMIT_MUTEX;
 }
+constexpr uint64_t kDefaultPrefetchPages = 16; // ADR 007 slice 4; 0 disables
+uint64_t prefetch_from_env() { return env_int("SG_PREFETCH_PAGES", kDefaultPrefetchPages, 0, 4096); }
 // SG_DEVICE_CPU=<n> pins the compute engine's thread; -1 (default) leaves it to the OS.
 int device_cpu_from_env() {
     const char* e = std::getenv("SG_DEVICE_CPU");
@@ -113,12 +127,28 @@ using PutSnapshot = uint64_t[SG_MAX_ENGINES][SG_MAX_CHANNELS];
 // Something the user has released that in-flight commands may still touch.
 // Safe to recycle once every channel has retired the PUT snapshot.
 struct Pending {
-    enum Kind { kVram, kPin } kind;
+    enum Kind { kVram, kManaged, kPin } kind;
     uint64_t addr;
     uint64_t size;
     void* host; // managed backing to free on recycle; nullptr otherwise
     PutSnapshot fence;
 };
+
+// A live user allocation. `host` is the managed backing; nullptr for sgMalloc.
+struct Alloc {
+    uint64_t size;
+    void* host;
+};
+
+// Where a channel's faults are heading: `next` is the page after the last
+// one migrated for this stream. Fault thread only.
+struct FaultStream {
+    uint64_t next = 0;
+    uint64_t used = 0; // LRU stamp; 0 = empty
+};
+// A few per channel, so commands that walk several operands at once
+// (non-overlapping D2D alternates dst and src pages) still look sequential.
+constexpr int kFaultStreams = 4;
 
 struct Driver;
 
@@ -140,17 +170,34 @@ struct Driver {
     uint32_t num_engines = 0;
     uint32_t num_channels = 0;
     uint32_t submit_mode = SG_SUBMIT_MUTEX;
-    device::Device dev{SG_VRAM_SIZE, copy_engines_from_env(), channels_from_env()};
+    device::Device dev{SG_VRAM_SIZE, SG_VA_SIZE, copy_engines_from_env(), channels_from_env()};
 
     std::unique_ptr<sg_cmd, FreeDeleter> ring[SG_MAX_ENGINES][SG_MAX_CHANNELS];
     uint32_t depth = 0;
     Producer prod[SG_MAX_ENGINES][SG_MAX_CHANNELS];
 
-    // VRAM allocator and the deferred-release list share one lock; the
-    // submit path only reads (owns_range) and takes it shared.
+    // Live allocations, the managed VA allocator, and the deferred-release
+    // list share one lock; the submit path only reads (owns) and takes it
+    // shared.
     std::shared_mutex alloc_lock;
-    VramAllocator vram{SG_VRAM_SIZE, SG_ALLOC_ALIGN};
+    std::map<uint64_t, Alloc> allocs; // device VA -> allocation
+    VramAllocator managed_va{SG_VRAM_SIZE, SG_VA_SIZE - SG_VRAM_SIZE, SG_ALLOC_ALIGN};
     std::vector<Pending> pending;
+
+    // VRAM frames and the resident managed pages. The fault thread holds
+    // this for a whole migration, including the eviction it may need.
+    std::mutex mem_lock;
+    VramAllocator vram{0, SG_VRAM_SIZE, SG_ALLOC_ALIGN};
+    std::list<uint64_t> resident; // managed page VAs in VRAM; CLOCK hand at the front
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> resident_pos;
+    // Mapped managed ranges, start -> end, so prefetch stays inside the
+    // faulting allocation without the fault thread taking alloc_lock.
+    std::map<uint64_t, uint64_t> managed_ranges;
+
+    // Prefetch (fault thread only, apart from the knob).
+    uint64_t prefetch_pages = kDefaultPrefetchPages;
+    FaultStream streams[SG_MAX_ENGINES][SG_MAX_CHANNELS][kFaultStreams];
+    uint64_t stream_clock = 0;
 
     // Pinned host ranges: looked up on every copy submit (shared), changed
     // rarely (exclusive).
@@ -179,11 +226,8 @@ struct Driver {
     std::atomic<uint64_t> waits{0}, waits_spun{0}, waits_blocked{0}, wake_latency_ns{0};
     std::atomic<uint64_t> submits{0}, stalls{0}, staging_waits{0}, lock_wait_ns{0};
     std::atomic<uint64_t> bytes_h2d{0}, bytes_d2h{0}, bytes_direct{0}, bytes_staged{0};
+    std::atomic<uint64_t> migrations{0}, prefetches{0}, evictions{0}, writebacks{0}, bytes_migrated{0};
 
-    // Managed allocations: device VA -> host backing. The MMU holds the
-    // per-page host address the fault thread copies from; this map owns the
-    // allocation so sgFree can release it after the device is done.
-    std::unordered_map<uint64_t, void*> managed;
     std::atomic<bool> fault_stop{false};
     std::thread fault_th;
 
@@ -211,6 +255,7 @@ struct Driver {
         idle_ns = idle_ns_from_env();
         dev.set_idle_policy(idle_policy, idle_ns);
         if (const char* e = std::getenv("SG_EXPERIMENT_NO_FENCE")) dev.set_no_fence(*e == '1');
+        prefetch_pages = prefetch_from_env();
         fault_th = std::thread(service_faults, this);
     }
 
@@ -471,14 +516,154 @@ uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd
     return slot + 1;
 }
 
+// ---- managed memory: residency and eviction (caller holds mem_lock) --------
+
+void forget_resident(Driver& d, uint64_t va) {
+    auto it = d.resident_pos.find(va);
+    if (it == d.resident_pos.end()) return;
+    d.resident.erase(it->second);
+    d.resident_pos.erase(it);
+}
+
+// Take one resident managed page out of VRAM and return its frame. The
+// shootdown, then quiesce(), guarantee no engine can still reach the frame
+// through this VA; only then is it written back (if dirty) and reused.
+uint64_t evict_locked(Driver& d, uint64_t va) {
+    auto& mmu = d.dev.mmu();
+    const device::PageInfo pg = mmu.page(va);
+    const uint64_t old = mmu.begin_evict(va);
+    d.dev.quiesce();
+    const uint64_t late = mmu.end_evict(va);
+    const uint64_t pa = device::pte_pa(old);
+    if ((old | late) & device::PTE_DIRTY) {
+        d.dev.copy_out(pa, reinterpret_cast<void*>(pg.host));
+        d.writebacks.fetch_add(1, std::memory_order_relaxed);
+        d.bytes_migrated.fetch_add(SG_PAGE_SIZE, std::memory_order_relaxed);
+    }
+    d.evictions.fetch_add(1, std::memory_order_relaxed);
+    forget_resident(d, va);
+    return pa;
+}
+
+// CLOCK: a page referenced since the hand last passed gets a second chance.
+// One full pass clears every reference bit, so this always picks someone.
+std::optional<uint64_t> evict_one_locked(Driver& d) {
+    if (d.resident.empty()) return std::nullopt;
+    for (size_t chances = d.resident.size(); chances--;) {
+        if (!d.dev.mmu().test_and_clear_accessed(d.resident.front())) break;
+        d.resident.splice(d.resident.end(), d.resident, d.resident.begin());
+    }
+    return evict_locked(d, d.resident.front());
+}
+
+// Make every managed page host-resident again and return the frames, so
+// an sgMalloc can use them.
+void evict_all_locked(Driver& d) {
+    while (!d.resident.empty()) d.vram.free(evict_locked(d, d.resident.front()));
+}
+
+// Migrate one page: take a free frame or evict for one, copy the host
+// backing in, and publish the PTE. Already resident (two channels faulted
+// on the same page, or prefetch got there first) is success with *moved
+// left false.
+int migrate_locked(Driver& d, uint64_t va, bool* moved) {
+    auto& mmu = d.dev.mmu();
+    const device::PageInfo pg = mmu.page(va);
+    if (pg.kind == device::PageInfo::Vram) return 0;
+    if (pg.kind != device::PageInfo::Host || pg.host == 0) return -EFAULT;
+    std::optional<uint64_t> frame = d.vram.alloc(SG_PAGE_SIZE);
+    if (!frame) frame = evict_one_locked(d);
+    if (!frame) return -ENOMEM; // VRAM is all sgMalloc
+    if (int rc = d.dev.copy_in(*frame, reinterpret_cast<const void*>(pg.host))) {
+        d.vram.free(*frame);
+        return rc;
+    }
+    if (int rc = mmu.make_resident(va, *frame)) {
+        d.vram.free(*frame);
+        return rc;
+    }
+    d.resident.push_back(va);
+    d.resident_pos[va] = std::prev(d.resident.end());
+    d.migrations.fetch_add(1, std::memory_order_relaxed);
+    d.bytes_migrated.fetch_add(SG_PAGE_SIZE, std::memory_order_relaxed);
+    *moved = true;
+    return 0;
+}
+
+// Is a fault at `va` where one of this channel's recent fault streams
+// expected the next one? Returns that stream, or recycles the least
+// recently used one for a new stream starting here.
+FaultStream& match_stream(Driver& d, uint32_t engine, uint32_t channel, uint64_t va, bool* sequential) {
+    FaultStream* set = d.streams[engine][channel];
+    FaultStream* lru = &set[0];
+    for (int i = 0; i < kFaultStreams; ++i) {
+        if (set[i].used && set[i].next == va) {
+            *sequential = true;
+            set[i].used = ++d.stream_clock;
+            return set[i];
+        }
+        if (set[i].used < lru->used) lru = &set[i];
+    }
+    *sequential = false;
+    lru->used = ++d.stream_clock;
+    return *lru;
+}
+
+// Speculatively migrate pages from `va` on, up to the end of the managed
+// allocation that contains it. Returns the first page not covered.
+//
+// One service never migrates more than half of the frames managed memory
+// can use (demand page included). Pages migrated in this service sit
+// behind every older page in CLOCK order, so with that cap the evictions
+// it causes only take older pages, and the newest half (other channels'
+// just-migrated demand pages) survives until they retry. Uncapped, a
+// window wider than the free frames evicts its own pages before the
+// channel reaches them, so they migrate twice (managed_prefetch_under_
+// pressure), and at worst the demand page goes before its channel resumes.
+uint64_t prefetch_locked(Driver& d, uint64_t va) {
+    auto it = d.managed_ranges.upper_bound(va);
+    if (it == d.managed_ranges.begin()) return va;
+    --it;
+    const uint64_t end = it->second;
+    const uint64_t capacity = (SG_VRAM_SIZE - d.vram.bytes_live()) / SG_PAGE_SIZE + d.resident.size();
+    const uint64_t budget = std::min<uint64_t>(d.prefetch_pages, capacity / 2 > 0 ? capacity / 2 - 1 : 0);
+    for (uint64_t i = 0; i < budget && va < end; ++i, va += SG_PAGE_SIZE) {
+        bool moved = false;
+        if (migrate_locked(d, va, &moved) != 0) break;
+        if (moved) d.prefetches.fetch_add(1, std::memory_order_relaxed);
+    }
+    return va;
+}
+
 // Recycle a detached allocation. Caller holds alloc_lock. Unmap first so a
 // stale TLB cannot observe the frame after it returns to the free list.
 void recycle(Driver& d, const Pending& p) {
-    if (p.kind != Pending::kVram) return;
+    if (p.kind == Pending::kPin) return;
     const uint64_t pages = p.size / SG_PAGE_SIZE;
-    if (pages != 0) d.dev.mmu().unmap(p.addr, pages);
-    if (p.host) std::free(p.host);
-    d.vram.release(p.addr, p.size);
+    auto& mmu = d.dev.mmu();
+    {
+        Guard g(d, d.mem_lock);
+        if (p.kind == Pending::kVram) {
+            mmu.unmap(p.addr, pages);
+            d.vram.free(p.addr);
+        } else {
+            d.managed_ranges.erase(p.addr);
+            std::vector<uint64_t> frames;
+            for (uint64_t i = 0; i < pages; ++i) {
+                const uint64_t va = p.addr + i * SG_PAGE_SIZE;
+                const device::PageInfo pg = mmu.page(va);
+                if (pg.kind != device::PageInfo::Vram) continue;
+                forget_resident(d, va);
+                frames.push_back(pg.pa);
+            }
+            mmu.unmap(p.addr, pages);
+            for (uint64_t f : frames) d.vram.free(f);
+        }
+    }
+    if (p.kind == Pending::kManaged) {
+        d.managed_va.free(p.addr);
+        std::free(p.host);
+    }
 }
 
 // Recycle everything the device has finished with. Caller holds alloc_lock.
@@ -492,9 +677,13 @@ void reclaim_locked(Driver& d) {
     d.pending.erase(keep, d.pending.end());
 }
 
+// Is [addr, addr+len) entirely inside one live allocation?
 bool owns(Driver& d, uint64_t addr, uint64_t len) {
     SharedGuard g(d, d.alloc_lock);
-    return d.vram.owns_range(addr, len);
+    auto it = d.allocs.upper_bound(addr);
+    if (it == d.allocs.begin()) return false;
+    --it;
+    return addr - it->first <= it->second.size && len <= it->second.size - (addr - it->first);
 }
 
 // Is [addr, addr+size) entirely inside one pinned range?
@@ -696,21 +885,40 @@ int do_submit(Driver& d, sg_submit_args& a) {
 }
 
 // UVM thread: migrate host-resident pages and unpark the channel that
-// faulted. Does not take alloc_lock — ALLOC can drain while holding it,
-// and drain waits for this thread to finish the fault.
+// faulted. Takes mem_lock but never alloc_lock — ALLOC can drain while
+// holding alloc_lock, and drain waits for this thread to finish the fault.
+//
+// The channel is unparked as soon as its own page is in; a prefetch runs
+// after that, so the channel computes on the demand page while the next
+// ones copy in. If it reaches a page the prefetch has not got to yet, it
+// faults, and that fault finds the page resident once the window is done.
 void service_faults(Driver* self) {
-    while (!self->fault_stop.load(std::memory_order_acquire)) {
+    Driver& d = *self;
+    while (!d.fault_stop.load(std::memory_order_acquire)) {
         device::Device::Fault f;
-        const uint32_t seen = self->dev.fault_irq().seq();
-        if (!self->dev.pop_fault(&f)) {
-            if (self->fault_stop.load(std::memory_order_acquire)) break;
-            self->dev.fault_irq().wait(seen, 1000000000ull);
+        const uint32_t seen = d.dev.fault_irq().seq();
+        if (!d.dev.pop_fault(&f)) {
+            if (d.fault_stop.load(std::memory_order_acquire)) break;
+            d.dev.fault_irq().wait(seen, 1000000000ull);
             continue;
         }
-        const int rc = self->dev.migrate_in(f.va);
-        if (rc != 0)
-            self->dev.channel(f.engine, f.channel).fault_fail.store(rc, std::memory_order_release);
-        self->dev.unpark(f.engine, f.channel);
+        const uint64_t va = device::page_floor(f.va);
+        bool moved = false;
+        int rc;
+        {
+            std::lock_guard<std::mutex> g(d.mem_lock);
+            rc = migrate_locked(d, va, &moved);
+        }
+        if (rc != 0) d.dev.channel(f.engine, f.channel).fault_fail.store(rc, std::memory_order_release);
+        d.dev.unpark(f.engine, f.channel);
+        if (!moved) continue;
+        bool sequential = false;
+        FaultStream& s = match_stream(d, f.engine, f.channel, va, &sequential);
+        s.next = va + SG_PAGE_SIZE;
+        if (sequential && d.prefetch_pages) {
+            std::lock_guard<std::mutex> g(d.mem_lock);
+            s.next = prefetch_locked(d, s.next);
+        }
     }
 }
 
@@ -789,25 +997,41 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         if (a->size == 0) return -EINVAL;
         ExclusiveGuard g(d, d.alloc_lock);
         reclaim_locked(d);
-        auto addr = d.vram.alloc(a->size);
+        auto take = [&]() -> std::optional<uint64_t> {
+            Guard m(d, d.mem_lock);
+            return d.vram.alloc(a->size);
+        };
+        auto addr = take();
         if (!addr) {
             // Maybe everything we need is sitting in the deferred list.
             if (int rc = drain(d)) return rc;
             reclaim_locked(d);
-            addr = d.vram.alloc(a->size);
-            if (!addr) {
-                if (std::getenv("SG_TRACE"))
-                    std::fprintf(stderr, "[drv] ENOMEM size=%llu live=%llu pending=%zu\n",
-                                 (unsigned long long)a->size, (unsigned long long)d.vram.bytes_live(), d.pending.size());
-                return -ENOMEM;
-            }
+            addr = take();
         }
-        a->addr = *addr;
+        if (!addr) {
+            // Then managed pages give way: they can live in host memory.
+            {
+                Guard m(d, d.mem_lock);
+                evict_all_locked(d);
+            }
+            addr = take();
+        }
+        if (!addr) {
+            if (std::getenv("SG_TRACE")) {
+                Guard m(d, d.mem_lock);
+                std::fprintf(stderr, "[drv] ENOMEM size=%llu live=%llu pending=%zu\n",
+                             (unsigned long long)a->size, (unsigned long long)d.vram.bytes_live(), d.pending.size());
+            }
+            return -ENOMEM;
+        }
         const uint64_t pages = (a->size + SG_PAGE_SIZE - 1) / SG_PAGE_SIZE;
         if (int rc = d.dev.mmu().map_vram(*addr, *addr, pages)) {
+            Guard m(d, d.mem_lock);
             d.vram.free(*addr);
             return rc;
         }
+        d.allocs.emplace(*addr, Alloc{pages * SG_PAGE_SIZE, nullptr});
+        a->addr = *addr;
         return 0;
     }
     case SG_IOC_ALLOC_MANAGED: {
@@ -816,27 +1040,33 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         if (a->size == 0) return -EINVAL;
         ExclusiveGuard g(d, d.alloc_lock);
         reclaim_locked(d);
-        auto addr = d.vram.alloc(a->size);
+        // Only VA is reserved here; frames are taken one page at a time on
+        // first touch.
+        auto addr = d.managed_va.alloc(a->size);
         if (!addr) {
             if (int rc = drain(d)) return rc;
             reclaim_locked(d);
-            addr = d.vram.alloc(a->size);
+            addr = d.managed_va.alloc(a->size);
             if (!addr) return -ENOMEM;
         }
         const uint64_t pages = (a->size + SG_PAGE_SIZE - 1) / SG_PAGE_SIZE;
         const uint64_t bytes = pages * SG_PAGE_SIZE;
         void* host = nullptr;
         if (posix_memalign(&host, SG_PAGE_SIZE, bytes) != 0) {
-            d.vram.free(*addr);
+            d.managed_va.free(*addr);
             return -ENOMEM;
         }
         std::memset(host, 0, bytes);
         if (int rc = d.dev.mmu().map_host(*addr, reinterpret_cast<uint64_t>(host), pages)) {
             std::free(host);
-            d.vram.free(*addr);
+            d.managed_va.free(*addr);
             return rc;
         }
-        d.managed.emplace(*addr, host);
+        {
+            Guard m(d, d.mem_lock);
+            d.managed_ranges.emplace(*addr, *addr + bytes);
+        }
+        d.allocs.emplace(*addr, Alloc{bytes, host});
         a->addr = *addr;
         a->host_ptr = reinterpret_cast<uint64_t>(host);
         return 0;
@@ -846,18 +1076,15 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         const uint64_t addr = static_cast<sg_free_args*>(arg)->addr;
         ExclusiveGuard g(d, d.alloc_lock);
         reclaim_locked(d);
-        uint64_t size = 0;
-        if (!d.vram.detach(addr, &size)) return -EINVAL;
-        void* host = nullptr;
-        if (auto it = d.managed.find(addr); it != d.managed.end()) {
-            host = it->second;
-            d.managed.erase(it);
-        }
+        auto it = d.allocs.find(addr);
+        if (it == d.allocs.end()) return -EINVAL;
+        const Alloc al = it->second;
+        d.allocs.erase(it);
         // Nothing may be handed this memory until every command issued so
         // far, on any channel, has retired; recycle it then rather than
         // draining now. The mapping stays until then, so an in-flight fault
         // can still copy out of the host backing.
-        Pending p{Pending::kVram, addr, size, host, {}};
+        Pending p{al.host ? Pending::kManaged : Pending::kVram, addr, al.size, al.host, {}};
         snapshot_puts(d, p.fence);
         if (all_retired(d, p.fence)) recycle(d, p);
         else d.pending.push_back(p);
@@ -919,6 +1146,9 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             s->wakeups[e] = st.wakeups.load(std::memory_order_relaxed);
             s->missed_doorbells[e] = st.missed_doorbells.load(std::memory_order_relaxed);
             s->cpu_ns[e] = st.cpu_ns.load(std::memory_order_relaxed);
+            s->faults[e] = st.faults.load(std::memory_order_relaxed);
+            s->tlb_hits[e] = d.dev.mmu().tlb_hits(e);
+            s->tlb_misses[e] = d.dev.mmu().tlb_misses(e);
         }
         auto ld = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
         s->submits = ld(d.submits);
@@ -933,13 +1163,19 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         s->bytes_d2h = ld(d.bytes_d2h);
         s->bytes_direct = ld(d.bytes_direct);
         s->bytes_staged = ld(d.bytes_staged);
+        s->migrations = ld(d.migrations);
+        s->prefetches = ld(d.prefetches);
+        s->evictions = ld(d.evictions);
+        s->writebacks = ld(d.writebacks);
+        s->bytes_migrated = ld(d.bytes_migrated);
         return 0;
     }
     case SG_IOC_RESET_STATS:
         d.dev.reset_stats();
         for (auto* c : {&d.submits, &d.waits, &d.waits_spun, &d.waits_blocked, &d.wake_latency_ns,
                         &d.lock_wait_ns, &d.stalls, &d.staging_waits, &d.bytes_h2d, &d.bytes_d2h,
-                        &d.bytes_direct, &d.bytes_staged})
+                        &d.bytes_direct, &d.bytes_staged, &d.migrations, &d.prefetches, &d.evictions,
+                        &d.writebacks, &d.bytes_migrated})
             c->store(0, std::memory_order_relaxed);
         return 0;
     default:

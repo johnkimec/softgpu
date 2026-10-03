@@ -11,6 +11,8 @@
 // sgMalloc pages are identity-mapped and always resident. A host-resident
 // page (managed memory) parks the channel, records a fault, and lets the
 // rest of the runlist proceed; the driver migrates the page and unparks.
+// Faults are replayable: a command records how far it got and resumes there,
+// so one command may touch more pages than VRAM has frames.
 //
 // STAGE 7: idle gating. An engine whose runlist has been empty for longer
 // than its idle budget goes to sleep on a per-engine futex instead of
@@ -92,13 +94,15 @@ struct alignas(64) EngineStats {
     std::atomic<uint64_t> wakeups{0};          // sleeps ended
     std::atomic<uint64_t> missed_doorbells{0}; // timeout wake that found work waiting
     std::atomic<uint64_t> cpu_ns{0};           // this engine thread's CPU time (absolute)
+    std::atomic<uint64_t> faults{0};           // commands parked on a host-resident page
     std::atomic<uint32_t> stats_gen{0}; // bumped by reset_stats(); engine restarts its idle timer
 };
 
 class Device {
 public:
-    // One compute engine plus `copy_engines` copy engines, `channels` rings each.
-    Device(uint64_t vram_bytes, uint32_t copy_engines, uint32_t channels);
+    // One compute engine plus `copy_engines` copy engines, `channels` rings
+    // each, and a `va_bytes` device address space over `vram_bytes` of VRAM.
+    Device(uint64_t vram_bytes, uint64_t va_bytes, uint32_t copy_engines, uint32_t channels);
     ~Device();
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
@@ -131,10 +135,14 @@ public:
     // with the run loop: store parked, then doorbell (which fences and
     // loads asleep).
     void unpark(uint32_t engine, uint32_t channel);
-    // Copy one host-resident page into its identity VRAM frame and publish
-    // the PTE. Already-resident is success. Called from the driver's fault
-    // thread, never from an engine.
-    int migrate_in(uint64_t va);
+    // Migration DMA: one page between a VRAM frame and host memory. The
+    // driver's fault thread programs these; engines never call them.
+    int copy_in(uint64_t pa, const void* host);
+    int copy_out(uint64_t pa, void* host);
+    // Shootdown acknowledgement: returns once every engine that was inside
+    // a command when this was called has finished it. After an MMU
+    // shootdown, nothing can still be touching the old frame.
+    void quiesce();
 
     // Idle gating policy; set before power_on().
     void set_idle_policy(uint32_t policy, uint64_t idle_ns) { idle_policy_ = policy; idle_ns_ = idle_ns; }
@@ -164,12 +172,31 @@ public:
     void reset_stats();
 
 private:
+    // Progress of a channel's head command across page faults. Engine
+    // thread only; reset when the command retires.
+    struct Replay {
+        uint64_t done = 0;   // bytes of the current phase already applied
+        uint32_t phase = 0;  // gather path: which operand is being moved
+        bool gather = false; // operands are not one contiguous resident run
+        std::vector<uint8_t> a, b, c;
+    };
+
     void run(uint32_t engine);
-    int execute(uint32_t engine, const sg_cmd& cmd, uint64_t* fault_va);
-    // Resolve a device VA range to a contiguous VRAM pointer. A host-resident
-    // page returns kPageFault and writes the page base to fault_va.
+    int execute(uint32_t engine, Replay& r, const sg_cmd& cmd, uint64_t* fault_va);
+    // The longest resident, physically contiguous run at `va`, at most
+    // `len` bytes. A host-resident first page returns kPageFault and
+    // writes the page base to fault_va.
+    int run_at(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out, uint64_t* n,
+               uint64_t* fault_va);
+    // Resolve a whole range to one contiguous VRAM pointer, or kPageFault,
+    // or kSplit if it is resident but not one run.
     int resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out,
                 uint64_t* fault_va);
+    // Apply `op(ptr, offset, n)` run by run over [va, va+len), resuming at
+    // r.done. A fault returns with r.done at the first unapplied byte.
+    template <class Op>
+    int for_runs(uint32_t engine, Replay& r, uint64_t va, uint64_t len, bool write,
+                 uint64_t* fault_va, Op op);
 
     // Wake gated engines that went to sleep with work pending behind a
     // WAIT_FENCE (a retirement may have satisfied it). Engines sleeping
@@ -177,7 +204,11 @@ private:
     void wake_blocked_sleepers(uint32_t self);
 
     Channel ch_[SG_MAX_ENGINES][SG_MAX_CHANNELS];
+    Replay replay_[SG_MAX_ENGINES][SG_MAX_CHANNELS];
     EngineStats stats_[SG_MAX_ENGINES];
+    // Odd while the engine is inside execute(); see quiesce().
+    struct alignas(64) AccessSeq { std::atomic<uint64_t> v{0}; };
+    AccessSeq access_[SG_MAX_ENGINES];
     Event irq_;
     std::atomic<uint64_t> last_irq_{0};
     Event fault_irq_;

@@ -18,9 +18,10 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   8u
+#define SG_ABI_VERSION   9u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_PAGE_SIZE     4096ull       /* device page; allocation granularity   */
+#define SG_VA_SIZE       (1ull << 30)  /* device VA space: [0, VRAM) sgMalloc (VA == PA), [VRAM, VA) managed */
 #define SG_STAGING_SLOTS 8u             /* default pageable-copy staging pool ...    */
 #define SG_STAGING_CHUNK (256ull << 10) /* ... 8 x 256 KiB, from the sweep in ADR 002 */
 #define SG_ALLOC_ALIGN   SG_PAGE_SIZE   /* VRAM allocation granularity            */
@@ -124,8 +125,13 @@ struct sg_alloc_args {
 /*
  * Managed memory: a device VA plus a host pointer to the same bytes.
  * Pages start host-resident; the first device access faults and the driver
- * copies the page into VRAM. Host writes after that access are not visible
- * to the device until a later slice migrates the page back (userfaultfd).
+ * copies the page into a free VRAM frame, evicting another managed page
+ * (written back if dirty) when none is free, so managed memory may exceed
+ * VRAM. Host writes after the device's first access are not visible to the
+ * device until a later slice migrates the page back (userfaultfd); device
+ * writes reach the host pointer when the page is evicted. When faults on a
+ * channel walk forward page by page, the driver also migrates the next
+ * SG_PREFETCH_PAGES pages of the same allocation (env; default 16, 0 = off).
  */
 struct sg_alloc_managed_args {
     uint64_t size;     /* in  */
@@ -186,6 +192,9 @@ struct sg_stats_args {
     uint64_t wakeups[SG_MAX_ENGINES];       /* times woken (doorbell, fence, timeout) */
     uint64_t missed_doorbells[SG_MAX_ENGINES]; /* woke by timeout and found work: a lost wake-up */
     uint64_t cpu_ns[SG_MAX_ENGINES];        /* engine thread CPU time, absolute (never reset) */
+    uint64_t faults[SG_MAX_ENGINES];        /* commands parked on a host-resident page */
+    uint64_t tlb_hits[SG_MAX_ENGINES];      /* page translations served by the TLB      */
+    uint64_t tlb_misses[SG_MAX_ENGINES];    /* ... that walked the page table           */
     /* driver-side */
     uint64_t submits;       /* driver: SG_IOC_SUBMIT calls                      */
     uint64_t waits;         /* driver: times the host had to wait on a fence    */
@@ -199,6 +208,12 @@ struct sg_stats_args {
     uint64_t bytes_d2h;
     uint64_t bytes_direct;  /* of the above, DMA'd to/from pinned memory        */
     uint64_t bytes_staged;  /* of the above, bounced through the staging pool   */
+    /* managed memory (fault thread) */
+    uint64_t migrations;    /* pages copied host -> VRAM, demand + prefetch     */
+    uint64_t prefetches;    /* ... of which speculative (SG_PREFETCH_PAGES)     */
+    uint64_t evictions;     /* pages moved out of VRAM to make room             */
+    uint64_t writebacks;    /* ... of which dirty, copied VRAM -> host          */
+    uint64_t bytes_migrated; /* migration DMA, both directions                  */
 };
 
 /*

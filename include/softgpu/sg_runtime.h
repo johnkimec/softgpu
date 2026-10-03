@@ -55,6 +55,9 @@ typedef struct sgStats {
     uint64_t engine_wakeups[SG_MAX_ENGINES_RT];
     uint64_t engine_missed_doorbells[SG_MAX_ENGINES_RT];
     uint64_t engine_cpu_ns[SG_MAX_ENGINES_RT];       /* engine thread CPU, absolute */
+    uint64_t engine_faults[SG_MAX_ENGINES_RT];       /* page faults (managed memory) */
+    uint64_t engine_tlb_hits[SG_MAX_ENGINES_RT];
+    uint64_t engine_tlb_misses[SG_MAX_ENGINES_RT];
     uint64_t driver_submits;
     uint64_t driver_waits;     /* times the host had to wait on the device     */
     uint64_t waits_spun;       /* ... satisfied while spinning                 */
@@ -67,6 +70,11 @@ typedef struct sgStats {
     uint64_t bytes_d2h;
     uint64_t bytes_direct;     /* copied straight to/from pinned host memory   */
     uint64_t bytes_staged;     /* bounced through the staging pool             */
+    uint64_t um_migrations;    /* managed pages moved into VRAM                */
+    uint64_t um_prefetches;    /* ... of which prefetched, not demanded        */
+    uint64_t um_evictions;     /* managed pages moved out of VRAM              */
+    uint64_t um_writebacks;    /* ... of which dirty (copied back to host)     */
+    uint64_t um_bytes_migrated; /* migration traffic, both directions          */
 } sgStats_t;
 
 /* Lifecycle. Not thread-safe with respect to each other. */
@@ -81,7 +89,9 @@ sgError_t sgFree(sgDevPtr ptr);
 /*
  * Managed memory. `host` is ordinary memory the CPU may read and write until
  * the device first touches the allocation; that access copies the pages into
- * VRAM. sgFree releases both sides.
+ * VRAM. Managed memory may exceed VRAM: under pressure, pages move back to
+ * `host` (with the device's writes) and fault in again on the next access.
+ * sgFree releases both sides.
  */
 sgError_t sgMallocManaged(sgDevPtr* dev, void** host, size_t bytes);
 

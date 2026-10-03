@@ -81,4 +81,7 @@ add_test(NAME runtime_gated COMMAND sgtest)
 set_tests_properties(runtime_gated PROPERTIES ENVIRONMENT "SG_ENGINE_IDLE=sleep;SG_WAIT_POLICY=spin" TIMEOUT 180)
 add_test(NAME runtime_gated_adaptive COMMAND sgtest)
 set_tests_properties(runtime_gated_adaptive PROPERTIES ENVIRONMENT "SG_ENGINE_IDLE=adaptive;SG_ENGINE_IDLE_NS=5000" TIMEOUT 180)
-set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 PROPERTIES TIMEOUT 120)
+# Managed memory with prefetch off: every page is its own fault.
+add_test(NAME runtime_prefetch0 COMMAND sgtest)
+set_tests_properties(runtime_prefetch0 PROPERTIES ENVIRONMENT "SG_PREFETCH_PAGES=0")
+set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 runtime_prefetch0 PROPERTIES TIMEOUT 120)

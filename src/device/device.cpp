@@ -33,9 +33,12 @@ uint64_t thread_cpu_ns() {
 
 } // namespace
 
-Device::Device(uint64_t vram_bytes, uint32_t copy_engines, uint32_t channels)
+// resolve(): resident but not one contiguous run. Internal; never retired.
+constexpr int kSplit = 2;
+
+Device::Device(uint64_t vram_bytes, uint64_t va_bytes, uint32_t copy_engines, uint32_t channels)
     : num_engines_(1 + copy_engines), num_channels_(channels), vram_(new uint8_t[vram_bytes]),
-      vram_size_(vram_bytes), mmu_(vram_bytes) {
+      vram_size_(vram_bytes), mmu_(va_bytes, vram_bytes) {
     // Touch every page so first-use page faults do not show up as device
     // "busy" time in the first benchmark that runs.
     std::memset(vram_.get(), 0, vram_bytes);
@@ -88,6 +91,7 @@ void Device::reset_stats() {
         st.sleep_cycles.store(0, std::memory_order_relaxed);
         st.wakeups.store(0, std::memory_order_relaxed);
         st.missed_doorbells.store(0, std::memory_order_relaxed);
+        st.faults.store(0, std::memory_order_relaxed);
         st.stats_gen.fetch_add(1, std::memory_order_release);
     }
     mmu_.reset_stats();
@@ -114,46 +118,80 @@ void Device::unpark(uint32_t engine, uint32_t channel) {
     doorbell(engine);
 }
 
-int Device::migrate_in(uint64_t va) {
-    va = page_floor(va);
-    const PageInfo pg = mmu_.page(va);
-    if (pg.kind == PageInfo::Vram) return 0;
-    if (pg.kind != PageInfo::Host || pg.host == 0) return -EFAULT;
-    if (va >= vram_size_) return -EFAULT;
-    std::memcpy(vram_.get() + va, reinterpret_cast<const void*>(pg.host), SG_PAGE_SIZE);
-    return mmu_.make_resident(va, va);
+int Device::copy_in(uint64_t pa, const void* host) {
+    if (page_offset(pa) || pa >= vram_size_ || !host) return -EFAULT;
+    std::memcpy(vram_.get() + pa, host, SG_PAGE_SIZE);
+    return 0;
 }
 
-// Translate [va, va+len) through the MMU and require a contiguous VRAM
-// mapping (true for identity-mapped allocations). A host-resident page is a
-// fault: the caller parks the channel and retries the command after the
-// driver migrates that page. Not-present is a hard -EFAULT.
+int Device::copy_out(uint64_t pa, void* host) {
+    if (page_offset(pa) || pa >= vram_size_ || !host) return -EFAULT;
+    std::memcpy(host, vram_.get() + pa, SG_PAGE_SIZE);
+    return 0;
+}
+
+// Dekker with the run loop: the caller has already changed the PTE and
+// cleared the TLB tags; the engine marks itself in-command, fences, then
+// translates. Either the engine's translate sees the shootdown, or this
+// load sees an odd sequence and waits for that command to finish.
+void Device::quiesce() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    for (uint32_t e = 0; e < num_engines_; ++e) {
+        const uint64_t s = access_[e].v.load(std::memory_order_acquire);
+        if (!(s & 1)) continue;
+        while (access_[e].v.load(std::memory_order_acquire) == s) cpu_relax();
+    }
+}
+
+// Translate page by page from `va` while frames stay contiguous. The page
+// after the run is translated too (that is how the run ends); its fault, if
+// any, is reported by the next call, once the run before it is applied.
+int Device::run_at(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out,
+                   uint64_t* n, uint64_t* fault_va) {
+    uint64_t base = 0, got = 0;
+    while (got < len) {
+        const uint64_t cur = va + got;
+        const Translate t = mmu_.translate(engine, cur, write);
+        if (t.status != Translate::Ok) {
+            if (got) break;
+            if (t.status == Translate::HostResident) {
+                *fault_va = page_floor(cur);
+                return kPageFault;
+            }
+            return -EFAULT;
+        }
+        const uint64_t pa = t.pa + page_offset(cur);
+        if (got == 0) base = pa;
+        else if (pa != base + got) break;
+        got += std::min(len - got, uint64_t{SG_PAGE_SIZE} - page_offset(cur));
+    }
+    if (base > vram_size_ || got > vram_size_ - base) return -EFAULT;
+    *out = vram_.get() + base;
+    *n = got;
+    return 0;
+}
+
 int Device::resolve(uint32_t engine, uint64_t va, uint64_t len, bool write, uint8_t** out,
                     uint64_t* fault_va) {
     if (len == 0) {
         *out = nullptr;
         return 0;
     }
-    uint64_t base = 0;
-    uint64_t left = len;
-    uint64_t cur = va;
-    while (left) {
-        const Translate t = mmu_.translate(engine, cur, write);
-        if (t.status == Translate::HostResident) {
-            *fault_va = page_floor(cur);
-            return kPageFault;
-        }
-        if (t.status != Translate::Ok) return -EFAULT;
-        const uint64_t off = page_offset(cur);
-        const uint64_t pa = t.pa + off;
-        if (cur == va) base = pa;
-        else if (pa != base + (cur - va)) return -EFAULT; // non-contiguous
-        const uint64_t chunk = std::min(left, uint64_t{SG_PAGE_SIZE} - off);
-        cur += chunk;
-        left -= chunk;
+    uint64_t n = 0;
+    if (int rc = run_at(engine, va, len, write, out, &n, fault_va)) return rc;
+    return n == len ? 0 : kSplit;
+}
+
+template <class Op>
+int Device::for_runs(uint32_t engine, Replay& r, uint64_t va, uint64_t len, bool write,
+                     uint64_t* fault_va, Op op) {
+    while (r.done < len) {
+        uint8_t* p = nullptr;
+        uint64_t n = 0;
+        if (int rc = run_at(engine, va + r.done, len - r.done, write, &p, &n, fault_va)) return rc;
+        op(p, r.done, n);
+        r.done += n;
     }
-    if (base > vram_size_ || len > vram_size_ - base) return -EFAULT;
-    *out = vram_.get() + base;
     return 0;
 }
 
@@ -189,6 +227,7 @@ void Device::run(uint32_t engine) {
     uint64_t seen_put[SG_MAX_CHANNELS] = {};
     uint64_t last_cpu_pub = mark;
     bool woke = false; // the previous round ended a sleep that was signalled
+    uint64_t aseq = access_[engine].v.load(std::memory_order_relaxed);
     st.cpu_ns.store(thread_cpu_ns(), std::memory_order_relaxed);
 
     while (running_.load(std::memory_order_relaxed)) {
@@ -211,6 +250,7 @@ void Device::run(uint32_t engine) {
                 int expected = 0;
                 ch.sticky_error.compare_exchange_strong(expected, fail, std::memory_order_relaxed);
                 if (put != k.get) {
+                    replay_[engine][c] = Replay{};
                     ++k.get;
                     ch.get.store(k.get, std::memory_order_release);
                     progress = true;
@@ -252,15 +292,22 @@ void Device::run(uint32_t engine) {
                 } else {
                     const uint64_t t0 = now_cycles();
                     uint64_t fault_va = 0;
-                    rc = execute(engine, cmd, &fault_va);
+                    Replay& r = replay_[engine][c];
+                    access_[engine].v.store(++aseq, std::memory_order_relaxed);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    rc = execute(engine, r, cmd, &fault_va);
+                    access_[engine].v.store(++aseq, std::memory_order_release);
                     st.busy_cycles.fetch_add(now_cycles() - t0, std::memory_order_relaxed);
                     if (rc == kPageFault) {
                         // Park before publishing the fault, so the handler
                         // cannot unpark a channel we then park again.
                         ch.parked.store(true, std::memory_order_seq_cst);
+                        st.faults.fetch_add(1, std::memory_order_relaxed);
                         push_fault(Fault{fault_va, engine, c});
                         break;
                     }
+                    if (r.gather) r = Replay{}; // drop the gather buffers too
+                    else r.done = 0;
                 }
                 if (rc != 0) {
                     int expected = 0;
@@ -402,21 +449,67 @@ void Device::run(uint32_t engine) {
     }
 }
 
-int Device::execute(uint32_t engine, const sg_cmd& c, uint64_t* fault_va) {
+int Device::execute(uint32_t engine, Replay& r, const sg_cmd& c, uint64_t* fault_va) {
     // Engine class check: a real copy engine has no ALUs and a compute engine
     // no DMA. The driver validates this too; the device is the last line.
     if (engine == SG_ENGINE_COMPUTE ? is_copy_op(c.opcode) : is_compute_op(c.opcode))
         return -EINVAL;
+
+    // Every command below may fault part-way. Work already applied stays
+    // applied and `r` remembers where to resume, so a retry never needs
+    // more pages resident at once than the run it is working on.
+    auto gather = [&](uint64_t va, uint64_t len, std::vector<uint8_t>& buf) {
+        if (buf.size() < len) buf.resize(len);
+        return for_runs(engine, r, va, len, false, fault_va,
+                        [&](uint8_t* p, uint64_t off, uint64_t n) { std::memcpy(buf.data() + off, p, n); });
+    };
+    auto scatter = [&](uint64_t va, uint64_t len, const std::vector<uint8_t>& buf) {
+        return for_runs(engine, r, va, len, true, fault_va,
+                        [&](uint8_t* p, uint64_t off, uint64_t n) { std::memcpy(p, buf.data() + off, n); });
+    };
+    // Two sources, one destination. Fast path: each operand is one resident
+    // contiguous run. Otherwise, and for every retry after a fault, move the
+    // operands through scratch a run at a time and compute there.
+    auto compute = [&](uint64_t b0, uint64_t b1, uint64_t bd, auto kernel) -> int {
+        if (!r.gather) {
+            uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
+            int rc = resolve(engine, c.src0, b0, false, &s0, fault_va);
+            if (rc == 0) rc = resolve(engine, c.src1, b1, false, &s1, fault_va);
+            if (rc == 0) rc = resolve(engine, c.dst, bd, true, &dst, fault_va);
+            if (rc == 0) {
+                kernel(dst, s0, s1);
+                return 0;
+            }
+            if (rc != kPageFault && rc != kSplit) return rc;
+            r.gather = true;
+            if (rc == kPageFault) return rc;
+        }
+        if (r.phase == 0) {
+            if (int rc = gather(c.src0, b0, r.a)) return rc;
+            r.phase = 1;
+            r.done = 0;
+        }
+        if (r.phase == 1) {
+            if (int rc = gather(c.src1, b1, r.b)) return rc;
+            r.phase = 2;
+            r.done = 0;
+        }
+        if (r.phase == 2) {
+            r.c.resize(bd);
+            kernel(r.c.data(), r.a.data(), r.b.data());
+            r.phase = 3;
+        }
+        return scatter(c.dst, bd, r.c);
+    };
 
     switch (c.opcode) {
     case SG_OP_NOP:
         return 0;
 
     case SG_OP_FILL: {
-        uint8_t* dst = nullptr;
-        if (int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va)) return rc;
-        std::memset(dst, static_cast<int>(c.value & 0xff), c.size);
-        return 0;
+        const int v = static_cast<int>(c.value & 0xff);
+        return for_runs(engine, r, c.dst, c.size, true, fault_va,
+                        [&](uint8_t* p, uint64_t, uint64_t n) { std::memset(p, v, n); });
     }
 
     // Host addresses in COPY_H2D/COPY_D2H are trusted, exactly as a DMA
@@ -424,61 +517,85 @@ int Device::execute(uint32_t engine, const sg_cmd& c, uint64_t* fault_va) {
     // responsible for only ever handing it its staging buffers or pinned
     // user memory. Device addresses go through the MMU.
     case SG_OP_COPY_H2D: {
-        uint8_t* dst = nullptr;
-        if (int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va)) return rc;
-        std::memcpy(dst, reinterpret_cast<const void*>(c.src0), c.size);
-        return 0;
+        const auto* src = reinterpret_cast<const uint8_t*>(c.src0);
+        return for_runs(engine, r, c.dst, c.size, true, fault_va,
+                        [&](uint8_t* p, uint64_t off, uint64_t n) { std::memcpy(p, src + off, n); });
     }
 
     case SG_OP_COPY_D2H: {
-        uint8_t* src = nullptr;
-        if (int rc = resolve(engine, c.src0, c.size, false, &src, fault_va)) return rc;
-        std::memcpy(reinterpret_cast<void*>(c.dst), src, c.size);
-        return 0;
+        auto* dst = reinterpret_cast<uint8_t*>(c.dst);
+        return for_runs(engine, r, c.src0, c.size, false, fault_va,
+                        [&](uint8_t* p, uint64_t off, uint64_t n) { std::memcpy(dst + off, p, n); });
     }
 
     case SG_OP_COPY_D2D: {
-        uint8_t *dst = nullptr, *src = nullptr;
-        if (int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va)) return rc;
-        if (int rc = resolve(engine, c.src0, c.size, false, &src, fault_va)) return rc;
-        std::memmove(dst, src, c.size);
-        return 0;
+        const bool overlap = c.size && c.dst < c.src0 + c.size && c.src0 < c.dst + c.size;
+        if (!overlap) {
+            // Distinct VAs never share a frame, so a forward copy is safe;
+            // each step goes as far as both sides' runs reach.
+            while (r.done < c.size) {
+                const uint64_t left = c.size - r.done;
+                uint8_t *dst = nullptr, *src = nullptr;
+                uint64_t nd = 0, ns = 0;
+                if (int rc = run_at(engine, c.dst + r.done, left, true, &dst, &nd, fault_va)) return rc;
+                if (int rc = run_at(engine, c.src0 + r.done, left, false, &src, &ns, fault_va)) return rc;
+                const uint64_t n = std::min(nd, ns);
+                std::memcpy(dst, src, n);
+                r.done += n;
+            }
+            return 0;
+        }
+        // Overlap needs memmove semantics: one run per side, or via scratch.
+        if (!r.gather) {
+            uint8_t *dst = nullptr, *src = nullptr;
+            int rc = resolve(engine, c.dst, c.size, true, &dst, fault_va);
+            if (rc == 0) rc = resolve(engine, c.src0, c.size, false, &src, fault_va);
+            if (rc == 0) {
+                std::memmove(dst, src, c.size);
+                return 0;
+            }
+            if (rc != kPageFault && rc != kSplit) return rc;
+            r.gather = true;
+            if (rc == kPageFault) return rc;
+        }
+        if (r.phase == 0) {
+            if (int rc = gather(c.src0, c.size, r.a)) return rc;
+            r.phase = 1;
+            r.done = 0;
+        }
+        return scatter(c.dst, c.size, r.a);
     }
 
     case SG_OP_VADD_F32: {
-        const uint64_t bytes = uint64_t{c.arg0} * sizeof(float);
-        uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
-        if (int rc = resolve(engine, c.dst, bytes, true, &dst, fault_va)) return rc;
-        if (int rc = resolve(engine, c.src0, bytes, false, &s0, fault_va)) return rc;
-        if (int rc = resolve(engine, c.src1, bytes, false, &s1, fault_va)) return rc;
-        const float* a = reinterpret_cast<const float*>(s0);
-        const float* b = reinterpret_cast<const float*>(s1);
-        float* out = reinterpret_cast<float*>(dst);
-        for (uint32_t i = 0; i < c.arg0; ++i) out[i] = a[i] + b[i];
-        return 0;
+        const uint32_t n = c.arg0;
+        const uint64_t bytes = uint64_t{n} * sizeof(float);
+        return compute(bytes, bytes, bytes, [n](uint8_t* d, const uint8_t* s0, const uint8_t* s1) {
+            const float* a = reinterpret_cast<const float*>(s0);
+            const float* b = reinterpret_cast<const float*>(s1);
+            float* out = reinterpret_cast<float*>(d);
+            for (uint32_t i = 0; i < n; ++i) out[i] = a[i] + b[i];
+        });
     }
 
     case SG_OP_GEMM_F32: {
         const uint64_t m = c.arg0, n = c.arg1, k = c.arg2;
-        uint8_t *dst = nullptr, *s0 = nullptr, *s1 = nullptr;
-        if (int rc = resolve(engine, c.src0, m * k * sizeof(float), false, &s0, fault_va)) return rc;
-        if (int rc = resolve(engine, c.src1, k * n * sizeof(float), false, &s1, fault_va)) return rc;
-        if (int rc = resolve(engine, c.dst, m * n * sizeof(float), true, &dst, fault_va)) return rc;
-        const float* a = reinterpret_cast<const float*>(s0);
-        const float* b = reinterpret_cast<const float*>(s1);
-        float* out = reinterpret_cast<float*>(dst);
-        // i-k-j ordering keeps the inner loop streaming over contiguous rows
-        // of B and C. Deliberately no blocking; this is the reference engine.
-        for (uint64_t i = 0; i < m; ++i) {
-            float* crow = out + i * n;
-            for (uint64_t j = 0; j < n; ++j) crow[j] = 0.0f;
-            for (uint64_t p = 0; p < k; ++p) {
-                const float aip = a[i * k + p];
-                const float* brow = b + p * n;
-                for (uint64_t j = 0; j < n; ++j) crow[j] += aip * brow[j];
+        return compute(m * k * sizeof(float), k * n * sizeof(float), m * n * sizeof(float),
+                       [m, n, k](uint8_t* d, const uint8_t* s0, const uint8_t* s1) {
+            const float* a = reinterpret_cast<const float*>(s0);
+            const float* b = reinterpret_cast<const float*>(s1);
+            float* out = reinterpret_cast<float*>(d);
+            // i-k-j ordering keeps the inner loop streaming over contiguous rows
+            // of B and C. Deliberately no blocking; this is the reference engine.
+            for (uint64_t i = 0; i < m; ++i) {
+                float* crow = out + i * n;
+                for (uint64_t j = 0; j < n; ++j) crow[j] = 0.0f;
+                for (uint64_t p = 0; p < k; ++p) {
+                    const float aip = a[i * k + p];
+                    const float* brow = b + p * n;
+                    for (uint64_t j = 0; j < n; ++j) crow[j] += aip * brow[j];
+                }
             }
-        }
-        return 0;
+        });
     }
 
     default:

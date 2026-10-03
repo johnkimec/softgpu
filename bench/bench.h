@@ -122,6 +122,15 @@ struct Window {
     double staging_waits() const { return double(s1.staging_waits - s0.staging_waits); }
     double bytes_direct() const { return double(s1.bytes_direct - s0.bytes_direct); }
     double bytes_staged() const { return double(s1.bytes_staged - s0.bytes_staged); }
+    // Device virtual memory (stage 5).
+    double faults() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_faults[e] - s0.engine_faults[e]); return n; }
+    double tlb_hits() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_tlb_hits[e] - s0.engine_tlb_hits[e]); return n; }
+    double tlb_misses() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += double(s1.engine_tlb_misses[e] - s0.engine_tlb_misses[e]); return n; }
+    double migrations() const { return double(s1.um_migrations - s0.um_migrations); }
+    double prefetches() const { return double(s1.um_prefetches - s0.um_prefetches); }
+    double evictions() const { return double(s1.um_evictions - s0.um_evictions); }
+    double writebacks() const { return double(s1.um_writebacks - s0.um_writebacks); }
+    double bytes_migrated() const { return double(s1.um_bytes_migrated - s0.um_bytes_migrated); }
 
     // Fill the standard metrics every benchmark reports.
     void fill(Row& r, double ops) const {
@@ -160,6 +169,16 @@ struct Window {
         if (bytes_direct() + bytes_staged() > 0)
             r.metrics["direct_frac"] = bytes_direct() / (bytes_direct() + bytes_staged());
         r.metrics["avg_batch"] = dev_cmds() / std::max(1.0, dev_batches());
+        if (tlb_hits() + tlb_misses() > 0) r.metrics["tlb_miss_rate"] = tlb_misses() / (tlb_hits() + tlb_misses());
+        // Managed memory, only where some was touched.
+        if (faults() + migrations() + evictions() > 0) {
+            r.metrics["faults_per_op"] = faults() / ops;
+            r.metrics["migrations_per_op"] = migrations() / ops;
+            r.metrics["prefetch_frac"] = prefetches() / std::max(1.0, migrations());
+            r.metrics["evictions_per_op"] = evictions() / ops;
+            r.metrics["writebacks_per_op"] = writebacks() / ops;
+            r.metrics["migrate_GBps"] = bytes_migrated() / std::max(1.0, wall_ns());
+        }
     }
 };
 
@@ -183,5 +202,8 @@ void bench_alloc(const Options&, Report&);
 void bench_pipeline(const Options&, Report&);
 void bench_wait(const Options&, Report&);
 void bench_wake(const Options&, Report&);
+void bench_fault(const Options&, Report&);
+void bench_tlb(const Options&, Report&);
+void bench_thrash(const Options&, Report&);
 
 } // namespace bench

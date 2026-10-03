@@ -4,7 +4,8 @@
 
 namespace softgpu::device {
 
-Mmu::Mmu(uint64_t va_bytes) : npages_(va_bytes / SG_PAGE_SIZE) {
+Mmu::Mmu(uint64_t va_bytes, uint64_t vram_bytes)
+    : npages_(va_bytes / SG_PAGE_SIZE), vram_pages_(vram_bytes / SG_PAGE_SIZE) {
     pte_.reset(new std::atomic<uint64_t>[npages_]());
     host_.reset(new std::atomic<uint64_t>[npages_]());
 }
@@ -15,7 +16,7 @@ int Mmu::map_vram(uint64_t va, uint64_t pa, uint64_t npages) {
     const uint64_t vpn0 = va >> SG_PAGE_SHIFT;
     const uint64_t pfn0 = pa >> SG_PAGE_SHIFT;
     if (vpn0 >= npages_ || npages > npages_ - vpn0) return -EINVAL;
-    if (pfn0 >= npages_ || npages > npages_ - pfn0) return -EINVAL;
+    if (pfn0 >= vram_pages_ || npages > vram_pages_ - pfn0) return -EINVAL;
 
     std::lock_guard<std::mutex> g(map_lock_);
     for (uint64_t i = 0; i < npages; ++i)
@@ -49,20 +50,49 @@ int Mmu::make_resident(uint64_t va, uint64_t pa) {
     if ((va | pa) & (SG_PAGE_SIZE - 1)) return -EINVAL;
     const uint64_t vpn = va >> SG_PAGE_SHIFT;
     const uint64_t pfn = pa >> SG_PAGE_SHIFT;
-    if (vpn >= npages_ || pfn >= npages_) return -EINVAL;
+    if (vpn >= npages_ || pfn >= vram_pages_) return -EINVAL;
 
     std::lock_guard<std::mutex> g(map_lock_);
     const uint64_t cur = pte_[vpn].load(std::memory_order_acquire);
     if (!(cur & PTE_PRESENT)) return -EINVAL;
     if (cur & PTE_IN_VRAM) return 0;
-    const uint64_t neu = PTE_PRESENT | PTE_IN_VRAM | PTE_ACCESSED | (cur & PTE_DIRTY) |
-                         (pfn << PTE_FRAME_SHIFT);
+    // Clean: the frame now matches the host backing. ACCESSED gives the
+    // page one CLOCK pass before it can be chosen as a victim.
+    const uint64_t neu = PTE_PRESENT | PTE_IN_VRAM | PTE_ACCESSED | (pfn << PTE_FRAME_SHIFT);
     pte_[vpn].store(neu, std::memory_order_release);
     // Same protocol as unmap: an insert that sampled the host PTE drops
     // its tag instead of caching a translation that is no longer host.
-    tlb_gen_.fetch_add(1, std::memory_order_release);
+    tlb_gen_.fetch_add(1, std::memory_order_seq_cst);
     tlb_invalidate_vpn(vpn);
     return 0;
+}
+
+uint64_t Mmu::begin_evict(uint64_t va) {
+    const uint64_t vpn = va >> SG_PAGE_SHIFT;
+    if (vpn >= npages_) return 0;
+
+    std::lock_guard<std::mutex> g(map_lock_);
+    const uint64_t cur = pte_[vpn].load(std::memory_order_acquire);
+    if ((cur & (PTE_PRESENT | PTE_IN_VRAM)) != (PTE_PRESENT | PTE_IN_VRAM)) return 0;
+    // exchange, not store: an engine's TLB hit may OR in DIRTY right now.
+    const uint64_t old = pte_[vpn].exchange(PTE_PRESENT, std::memory_order_seq_cst);
+    tlb_gen_.fetch_add(1, std::memory_order_seq_cst);
+    tlb_invalidate_vpn(vpn);
+    return old;
+}
+
+uint64_t Mmu::end_evict(uint64_t va) {
+    const uint64_t vpn = va >> SG_PAGE_SHIFT;
+    if (vpn >= npages_) return 0;
+    std::lock_guard<std::mutex> g(map_lock_);
+    return pte_[vpn].fetch_and(~(PTE_DIRTY | PTE_ACCESSED), std::memory_order_acq_rel) &
+           (PTE_DIRTY | PTE_ACCESSED);
+}
+
+bool Mmu::test_and_clear_accessed(uint64_t va) {
+    const uint64_t vpn = va >> SG_PAGE_SHIFT;
+    if (vpn >= npages_) return false;
+    return pte_[vpn].fetch_and(~PTE_ACCESSED, std::memory_order_acq_rel) & PTE_ACCESSED;
 }
 
 PageInfo Mmu::page(uint64_t va) const {
@@ -71,13 +101,13 @@ PageInfo Mmu::page(uint64_t va) const {
     if (vpn >= npages_) return info;
     const uint64_t pte = pte_[vpn].load(std::memory_order_acquire);
     if (!(pte & PTE_PRESENT)) return info;
+    info.host = host_[vpn].load(std::memory_order_acquire);
     if (pte & PTE_IN_VRAM) {
         info.kind = PageInfo::Vram;
         info.pa = pte_pa(pte);
         return info;
     }
     info.kind = PageInfo::Host;
-    info.host = host_[vpn].load(std::memory_order_acquire);
     return info;
 }
 
@@ -94,7 +124,7 @@ int Mmu::unmap(uint64_t va, uint64_t npages) {
     }
     // Publish the generation before the shootdown. An insert that stored
     // its tag after the shootdown re-reads the generation and clears it.
-    tlb_gen_.fetch_add(1, std::memory_order_release);
+    tlb_gen_.fetch_add(1, std::memory_order_seq_cst);
     for (uint64_t i = 0; i < npages; ++i) tlb_invalidate_vpn(vpn0 + i);
     return 0;
 }
@@ -103,7 +133,7 @@ void Mmu::tlb_invalidate_vpn(uint64_t vpn) {
     for (uint32_t e = 0; e < SG_MAX_ENGINES; ++e)
         for (uint32_t i = 0; i < SG_TLB_ENTRIES; ++i) {
             auto& tag = tlb_[e].entry[i].vpn;
-            if (tag.load(std::memory_order_relaxed) == vpn)
+            if (tag.load(std::memory_order_seq_cst) == vpn)
                 tag.store(~0ull, std::memory_order_release);
         }
 }
@@ -133,15 +163,17 @@ void Mmu::tlb_insert(uint32_t engine, uint64_t vpn, uint64_t pte) {
         }
     }
     // Tag is empty while the new PTE is stored, so a reader cannot pair
-    // this PTE with the previous VPN. The second generation check catches
-    // an unmap that landed after we sampled `gen`.
+    // this PTE with the previous VPN. The generation re-checks catch a
+    // mapping change that landed after we sampled `gen`; the tag store and
+    // the last re-check are seq_cst to pair with the shootdown's tag loads.
     slot->vpn.store(~0ull, std::memory_order_relaxed);
     slot->pte.store(pte, std::memory_order_relaxed);
     slot->last_used = tlb.clock++;
-    if ((pte_[vpn].load(std::memory_order_acquire) & (PTE_PRESENT | PTE_IN_VRAM)) == 0) return;
+    constexpr uint64_t kResident = PTE_PRESENT | PTE_IN_VRAM;
+    if ((pte_[vpn].load(std::memory_order_acquire) & kResident) != kResident) return;
     if (tlb_gen_.load(std::memory_order_acquire) != gen) return;
-    slot->vpn.store(vpn, std::memory_order_release);
-    if (tlb_gen_.load(std::memory_order_acquire) != gen)
+    slot->vpn.store(vpn, std::memory_order_seq_cst);
+    if (tlb_gen_.load(std::memory_order_seq_cst) != gen)
         slot->vpn.store(~0ull, std::memory_order_release);
 }
 

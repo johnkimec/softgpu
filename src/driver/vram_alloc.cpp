@@ -2,8 +2,8 @@
 
 namespace softgpu::driver {
 
-VramAllocator::VramAllocator(uint64_t size, uint64_t align) : align_(align) {
-    free_.emplace(0, size);
+VramAllocator::VramAllocator(uint64_t base, uint64_t size, uint64_t align) : align_(align) {
+    free_.emplace(base, size);
 }
 
 std::optional<uint64_t> VramAllocator::alloc(uint64_t bytes) {

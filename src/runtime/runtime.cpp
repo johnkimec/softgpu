@@ -489,6 +489,9 @@ sgError_t sgGetStats(sgStats_t* out) {
             out->engine_wakeups[e] = s.wakeups[e];
             out->engine_missed_doorbells[e] = s.missed_doorbells[e];
             out->engine_cpu_ns[e] = s.cpu_ns[e];
+            out->engine_faults[e] = s.faults[e];
+            out->engine_tlb_hits[e] = s.tlb_hits[e];
+            out->engine_tlb_misses[e] = s.tlb_misses[e];
         }
         out->driver_submits = s.submits;
         out->driver_waits = s.waits;
@@ -502,6 +505,11 @@ sgError_t sgGetStats(sgStats_t* out) {
         out->bytes_d2h = s.bytes_d2h;
         out->bytes_direct = s.bytes_direct;
         out->bytes_staged = s.bytes_staged;
+        out->um_migrations = s.migrations;
+        out->um_prefetches = s.prefetches;
+        out->um_evictions = s.evictions;
+        out->um_writebacks = s.writebacks;
+        out->um_bytes_migrated = s.bytes_migrated;
     }
     return from_errno(rc);
 }

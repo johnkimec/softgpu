@@ -8,6 +8,9 @@
 //   gemm    - compute-bound work, to see when submission cost stops mattering
 //   mt      - scaling with concurrent submitters (the big lock)
 //   alloc   - sgMalloc/sgFree cost while work is in flight (deferred frees)
+//   fault   - first touch of managed memory (fault + migrate, prefetch)
+//   tlb     - translation cost and TLB reach on resident memory
+//   thrash  - managed working sets larger than the free VRAM frames
 
 #include <atomic>
 #include <time.h>
@@ -483,6 +486,167 @@ void bench_wake(const Options& o, Report& rep) {
     }
     sgFree(d);
     die_on(sgSetSyncPolicy(SG_SYNC_DEFAULT), "sgSetSyncPolicy");
+}
+
+} // namespace bench
+
+namespace bench {
+
+namespace {
+
+constexpr size_t kPage = 4096;
+
+// Fill VRAM with sgMalloc so exactly `frames` frames stay free for managed
+// pages. Returns the blocks to free afterwards.
+std::vector<sgDevPtr> squeeze_vram(size_t frames) {
+    std::vector<std::pair<sgDevPtr, size_t>> held;
+    for (size_t chunk : {size_t{64} << 20, size_t{1} << 20, kPage})
+        for (sgDevPtr p = 0; sgMalloc(&p, chunk) == SG_OK;) held.push_back({p, chunk});
+    size_t freed = 0;
+    while (freed < frames * kPage && !held.empty()) {
+        die_on(sgFree(held.back().first), "sgFree");
+        freed += held.back().second;
+        held.pop_back();
+    }
+    for (size_t extra = freed / kPage - frames; extra--;) held.push_back({must_malloc(kPage), kPage});
+    std::vector<sgDevPtr> out;
+    for (auto& h : held) out.push_back(h.first);
+    return out;
+}
+
+} // namespace
+
+// First touch of managed memory. Every page of a fresh allocation starts in
+// host memory, so one device pass over it is fault-bound: seq_* walk forward
+// in one command (prefetch applies); strided_* touches one page per command
+// in steps of 7 pages, so no two faults look sequential and every page pays
+// a full fault round trip. Run once per SG_PREFETCH_PAGES setting.
+void bench_fault(const Options& o, Report& rep) {
+    const size_t sizes[] = {1u << 20, (o.quick ? 4u : 16u) << 20};
+    const int iters = o.quick ? 3 : 10;
+    enum Kind { kSeqD2H, kSeqFill, kStrided };
+    for (size_t bytes : sizes) {
+        const size_t pages = bytes / kPage;
+        uint8_t* pinned = nullptr;
+        die_on(sgMallocHost(reinterpret_cast<void**>(&pinned), bytes), "sgMallocHost");
+        for (Kind kind : {kSeqD2H, kSeqFill, kStrided}) {
+            double touch_ns = 0;
+            Window w;
+            w.begin();
+            for (int i = 0; i < iters; ++i) {
+                sgDevPtr d = 0;
+                void* host = nullptr;
+                die_on(sgMallocManaged(&d, &host, bytes), "sgMallocManaged");
+                auto t0 = Clock::now();
+                if (kind == kSeqD2H) {
+                    die_on(sgMemcpyD2H(pinned, d, bytes), "d2h");
+                } else if (kind == kSeqFill) {
+                    die_on(sgMemset(d, i, bytes), "memset");
+                } else {
+                    for (size_t k = 0; k < pages; ++k) {
+                        const size_t p = (k * 7) % pages;
+                        die_on(sgMemcpyD2HAsync(pinned + p * kPage, d + p * kPage, kPage, nullptr), "d2h");
+                    }
+                }
+                die_on(sgDeviceSynchronize(), "sync");
+                touch_ns += ns_since(t0);
+                die_on(sgFree(d), "sgFree");
+            }
+            w.end();
+            const char* kname = kind == kSeqD2H ? "seq_d2h" : kind == kSeqFill ? "seq_fill" : "strided_d2h";
+            char name[48];
+            std::snprintf(name, sizeof name, "%s_%zuKiB", kname, bytes >> 10);
+            Row r{"fault", name, {}};
+            r.metrics["MBps"] = double(bytes) * iters / touch_ns * 1e3;
+            r.metrics["us_per_page"] = touch_ns / (double(pages) * iters) / 1e3;
+            if (w.faults() > 0) r.metrics["us_per_fault"] = touch_ns / w.faults() / 1e3;
+            w.fill(r, double(pages) * iters);
+            rep.rows.push_back(r);
+        }
+        sgFreeHost(pinned);
+    }
+}
+
+// Translation on resident memory: sgMalloc only, no faults, just the
+// compute engine's 64-entry TLB. stream_* FILLs the whole working set per
+// pass; sparse_* FILLs 64 bytes at the start of each page, one command per
+// page, so translation is a bigger share of device time. busy_ns_per_page
+// is device execute time; the cliff should sit at 64 pages (256 KiB).
+void bench_tlb(const Options& o, Report& rep) {
+    std::vector<size_t> kib = o.quick ? std::vector<size_t>{64, 256, 1024}
+                                      : std::vector<size_t>{64, 128, 256, 512, 1024, 4096, 16384};
+    const size_t stream_budget = (o.quick ? 32u : 256u) << 20; // bytes filled per stream case
+    const size_t sparse_budget = o.quick ? 1u << 15 : 1u << 18; // commands per sparse case
+    for (int sparse = 0; sparse < 2; ++sparse)
+        for (size_t k : kib) {
+            const size_t bytes = k << 10, pages = bytes / kPage;
+            const int passes = int(std::max<size_t>(sparse ? 2 : 4, (sparse ? sparse_budget / pages : stream_budget / bytes)));
+            sgDevPtr d = must_malloc(bytes);
+            auto pass = [&](int v) {
+                if (!sparse) {
+                    die_on(sgMemset(d, v, bytes), "memset");
+                } else {
+                    for (size_t p = 0; p < pages; ++p) die_on(sgMemset(d + p * kPage, v, 64), "memset");
+                }
+            };
+            pass(0); // warm the TLB
+            Window w;
+            w.begin();
+            for (int i = 0; i < passes; ++i) pass(i);
+            die_on(sgDeviceSynchronize(), "sync");
+            w.end();
+            char name[48];
+            std::snprintf(name, sizeof name, "%s_%zuKiB", sparse ? "sparse" : "stream", k);
+            Row r{"tlb", name, {}};
+            const double touched = double(pages) * passes;
+            r.metrics["ns_per_page"] = w.wall_ns() / touched;
+            r.metrics["busy_ns_per_page"] = w.busy(0) / touched;
+            w.fill(r, touched);
+            rep.rows.push_back(r);
+            sgFree(d);
+        }
+}
+
+// Working sets around the managed frame pool. VRAM is filled with sgMalloc
+// except `pool` frames; a managed buffer of ratio x pool is walked in one
+// command per pass, after a warm-up pass. At 0.5x it stays resident; past
+// 1x, a cyclic walk under CLOCK evicts each page before it comes round
+// again (LRU's worst case), so every pass migrates the whole set. read_*
+// copies out (clean evictions), write_* fills (every eviction writes back).
+void bench_thrash(const Options& o, Report& rep) {
+    const size_t pool = o.quick ? 256 : 1024; // frames: 1 MiB / 4 MiB
+    const int passes = o.quick ? 2 : 5;
+    auto held = squeeze_vram(pool);
+    for (int write = 0; write < 2; ++write)
+        for (double ratio : {0.5, 1.5, 2.0, 4.0}) {
+            const size_t pages = size_t(ratio * double(pool)), bytes = pages * kPage;
+            sgDevPtr d = 0;
+            void* host = nullptr;
+            die_on(sgMallocManaged(&d, &host, bytes), "sgMallocManaged");
+            uint8_t* pinned = nullptr;
+            die_on(sgMallocHost(reinterpret_cast<void**>(&pinned), bytes), "sgMallocHost");
+            auto pass = [&](int v) {
+                if (write) die_on(sgMemset(d, v, bytes), "memset");
+                else die_on(sgMemcpyD2H(pinned, d, bytes), "d2h");
+                die_on(sgDeviceSynchronize(), "sync");
+            };
+            pass(0);
+            Window w;
+            w.begin();
+            for (int i = 0; i < passes; ++i) pass(i + 1);
+            w.end();
+            char name[48];
+            std::snprintf(name, sizeof name, "%s_%.1fx", write ? "write" : "read", ratio);
+            Row r{"thrash", name, {}};
+            const double touched = double(pages) * passes;
+            r.metrics["GBps"] = double(bytes) * passes / w.wall_ns();
+            r.metrics["us_per_page"] = w.wall_ns() / touched / 1e3;
+            w.fill(r, touched);
+            rep.rows.push_back(r);
+            sgFreeHost(pinned);
+            die_on(sgFree(d), "sgFree");
+        }
+    for (sgDevPtr p : held) sgFree(p);
 }
 
 } // namespace bench

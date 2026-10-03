@@ -1,8 +1,9 @@
 #pragma once
-// First-fit free-list allocator for device memory.
+// First-fit free-list allocator over [base, base + size).
 //
 // BASELINE: simplest correct thing. No size classes, no per-context pools,
-// O(#free blocks) allocation. It is protected by the driver's global lock.
+// O(#free blocks) allocation. The driver uses one instance for VRAM frames
+// and one for the managed VA range, each under its own lock.
 
 #include <cstdint>
 #include <map>
@@ -13,7 +14,7 @@ namespace softgpu::driver {
 
 class VramAllocator {
 public:
-    VramAllocator(uint64_t size, uint64_t align);
+    VramAllocator(uint64_t base, uint64_t size, uint64_t align);
 
     std::optional<uint64_t> alloc(uint64_t bytes);
     bool free(uint64_t addr); // detach + release

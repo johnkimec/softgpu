@@ -858,6 +858,390 @@ static void test_managed_two_channels() {
     CHECK_OK(sgStreamDestroy(b));
 }
 
+// Fill VRAM with sgMalloc so exactly `frames` 4 KiB frames stay free for
+// managed pages. Returns the blocks to free afterwards.
+static std::vector<sgDevPtr> squeeze_vram(size_t frames) {
+    const size_t pg = 4096;
+    std::vector<std::pair<sgDevPtr, size_t>> held;
+    for (size_t chunk : {size_t{64} << 20, size_t{1} << 20, pg})
+        for (sgDevPtr p = 0; sgMalloc(&p, chunk) == SG_OK;) held.push_back({p, chunk});
+    // VRAM is full. Give back the newest blocks until enough is free, then
+    // take back the excess a page at a time.
+    size_t freed = 0;
+    while (freed < frames * pg && !held.empty()) {
+        CHECK_OK(sgFree(held.back().first));
+        freed += held.back().second;
+        held.pop_back();
+    }
+    for (size_t extra = freed / pg - frames; extra--;) {
+        sgDevPtr p = 0;
+        CHECK_OK(sgMalloc(&p, pg));
+        held.push_back({p, pg});
+    }
+    std::vector<sgDevPtr> out;
+    for (auto& h : held) out.push_back(h.first);
+    return out;
+}
+
+// Read device memory through the compute engine's TLB (x + 0.0f leaves
+// these byte patterns unchanged) rather than the copy engine's.
+static void read_via_compute(uint8_t* out, sgDevPtr src, sgDevPtr zeros, sgDevPtr tmp, size_t n) {
+    CHECK_OK(sgVaddF32(tmp, src, zeros, uint32_t(n / 4)));
+    CHECK_OK(sgMemcpyD2H(out, tmp, n));
+}
+
+static void test_managed_evict_writeback() {
+    // 64 managed pages through 16 free frames: every fault past the 16th
+    // evicts, and a page the device wrote must reach the host backing.
+    const size_t frames = 16, pages = 64, pg = 4096, n = pages * pg;
+    sgDevPtr d = 0;
+    void* host_void = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &host_void, n));
+    auto* host = static_cast<uint8_t*>(host_void);
+    auto held = squeeze_vram(frames);
+    for (size_t i = 0; i < pages; ++i) CHECK_OK(sgMemset(d + i * pg, int(i + 1), pg));
+    CHECK_OK(sgDeviceSynchronize());
+    // At most `frames` pages can still be resident; all earlier ones were
+    // evicted dirty.
+    bool ok = true;
+    for (size_t i = 0; i + frames < pages && ok; ++i)
+        ok = std::all_of(host + i * pg, host + (i + 1) * pg, [&](uint8_t v) { return v == uint8_t(i + 1); });
+    CHECK(ok);
+    // Reading through the device migrates the evicted pages back in.
+    std::vector<uint8_t> out(n, 0);
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    ok = true;
+    for (size_t i = 0; i < n && ok; ++i) ok = out[i] == uint8_t(i / pg + 1);
+    CHECK(ok);
+    for (sgDevPtr p : held) CHECK_OK(sgFree(p));
+    CHECK_OK(sgFree(d));
+}
+
+static void test_managed_oversubscribed_compute() {
+    // Three 32-page arrays through 8 free frames (12x oversubscribed): VADD
+    // cannot hold its operands resident at once and must stream them.
+    // GEMM likewise with 12 operand pages.
+    const size_t frames = 8;
+    const uint32_t n = 32 * 1024;
+    const size_t bytes = size_t{n} * 4;
+    sgDevPtr a = 0, b = 0, c = 0;
+    void *ha = nullptr, *hb = nullptr, *hc = nullptr;
+    CHECK_OK(sgMallocManaged(&a, &ha, bytes));
+    CHECK_OK(sgMallocManaged(&b, &hb, bytes));
+    CHECK_OK(sgMallocManaged(&c, &hc, bytes));
+    for (uint32_t i = 0; i < n; ++i) {
+        static_cast<float*>(ha)[i] = float(i);
+        static_cast<float*>(hb)[i] = 2.0f * float(i);
+    }
+    const uint32_t m = 64, k = 64, w = 64;
+    sgDevPtr ga = 0, gb = 0, gc = 0;
+    void *hga = nullptr, *hgb = nullptr, *hgc = nullptr;
+    CHECK_OK(sgMallocManaged(&ga, &hga, m * k * 4));
+    CHECK_OK(sgMallocManaged(&gb, &hgb, k * w * 4));
+    CHECK_OK(sgMallocManaged(&gc, &hgc, m * w * 4));
+    auto* fa = static_cast<float*>(hga);
+    auto* fb = static_cast<float*>(hgb);
+    for (uint32_t i = 0; i < m * k; ++i) fa[i] = float((i * 7) % 13) - 6.0f;
+    for (uint32_t i = 0; i < k * w; ++i) fb[i] = float((i * 5) % 11) - 5.0f;
+    std::vector<float> ref(m * w, 0.0f);
+    for (uint32_t i = 0; i < m; ++i)
+        for (uint32_t j = 0; j < w; ++j)
+            for (uint32_t p = 0; p < k; ++p) ref[i * w + j] += fa[i * k + p] * fb[p * w + j];
+
+    auto held = squeeze_vram(frames);
+    CHECK_OK(sgVaddF32(c, a, b, n));
+    std::vector<float> out(n, -1.0f);
+    CHECK_OK(sgMemcpyD2H(out.data(), c, bytes));
+    bool ok = true;
+    for (uint32_t i = 0; i < n && ok; ++i) ok = out[i] == 3.0f * float(i);
+    CHECK(ok);
+    CHECK_OK(sgGemmF32(gc, ga, gb, m, w, k));
+    std::vector<float> gout(m * w, 0.0f);
+    CHECK_OK(sgMemcpyD2H(gout.data(), gc, gout.size() * 4));
+    ok = true;
+    for (size_t i = 0; i < gout.size() && ok; ++i) ok = std::fabs(gout[i] - ref[i]) < 1e-3f;
+    CHECK(ok);
+    for (sgDevPtr p : held) CHECK_OK(sgFree(p));
+    for (sgDevPtr p : {a, b, c, ga, gb, gc}) CHECK_OK(sgFree(p));
+}
+
+static void test_managed_tlb_shootdown() {
+    // Every page here fits in the compute engine's 64-entry TLB at once, so
+    // if eviction skipped its shootdown (or unmap and the remap at the same
+    // VA both did), the stale entry would hit and read a frame that now
+    // holds another page, or one nothing was migrated into.
+    const size_t frames = 16, pages = 48, pg = 4096;
+    sgDevPtr zeros = 0, tmp = 0, d = 0;
+    CHECK_OK(sgMalloc(&zeros, pg));
+    CHECK_OK(sgMalloc(&tmp, pg));
+    CHECK_OK(sgMemset(zeros, 0, pg));
+    void* host_void = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &host_void, pages * pg));
+    auto held = squeeze_vram(frames);
+
+    // Eviction: writing pages 16.. reuses the frames of pages 0..
+    for (size_t i = 0; i < pages; ++i) CHECK_OK(sgMemset(d + i * pg, int(i + 1), pg));
+    std::vector<uint8_t> out(pg);
+    bool ok = true;
+    for (size_t i = 0; i < pages && ok; ++i) {
+        read_via_compute(out.data(), d + i * pg, zeros, tmp, pg);
+        ok = std::all_of(out.begin(), out.end(), [&](uint8_t v) { return v == uint8_t(i + 1); });
+    }
+    CHECK(ok);
+
+    // Unmap: a new allocation at the freed VA must fault in its own bytes,
+    // not hit the old translation.
+    sgDevPtr x = 0, y = 0;
+    void *hx = nullptr, *hy = nullptr;
+    CHECK_OK(sgMallocManaged(&x, &hx, pg));
+    CHECK_OK(sgMemset(x, 0xAA, pg));
+    read_via_compute(out.data(), x, zeros, tmp, pg);
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0xAA; }));
+    CHECK_OK(sgFree(x));
+    CHECK_OK(sgMallocManaged(&y, &hy, pg));
+    CHECK(y == x); // first-fit hands the VA straight back
+    std::memset(hy, 0x55, pg);
+    read_via_compute(out.data(), y, zeros, tmp, pg);
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0x55; }));
+
+    for (sgDevPtr p : held) CHECK_OK(sgFree(p));
+    for (sgDevPtr p : {y, d, zeros, tmp}) CHECK_OK(sgFree(p));
+}
+
+// ---- stage 5 slice 4: prefetch and VM counters ---------------------------------
+
+static uint64_t prefetch_window() {
+    const char* e = std::getenv("SG_PREFETCH_PAGES");
+    return e ? std::strtoull(e, nullptr, 10) : 16;
+}
+
+struct VmDelta {
+    uint64_t faults = 0, tlb_hits = 0, tlb_misses = 0;
+    uint64_t migrations = 0, prefetches = 0, evictions = 0, writebacks = 0, bytes = 0;
+};
+
+static VmDelta vm_delta(const sgStats_t& a, const sgStats_t& b) {
+    VmDelta d;
+    for (uint32_t e = 0; e < b.num_engines; ++e) {
+        d.faults += b.engine_faults[e] - a.engine_faults[e];
+        d.tlb_hits += b.engine_tlb_hits[e] - a.engine_tlb_hits[e];
+        d.tlb_misses += b.engine_tlb_misses[e] - a.engine_tlb_misses[e];
+    }
+    d.migrations = b.um_migrations - a.um_migrations;
+    d.prefetches = b.um_prefetches - a.um_prefetches;
+    d.evictions = b.um_evictions - a.um_evictions;
+    d.writebacks = b.um_writebacks - a.um_writebacks;
+    d.bytes = b.um_bytes_migrated - a.um_bytes_migrated;
+    return d;
+}
+
+static void test_managed_stats() {
+    // Everything fits: each page migrates exactly once however prefetch
+    // split the work, nothing is evicted, and a second pass is fault-free.
+    const size_t pages = 32, pg = 4096, n = pages * pg;
+    sgDevPtr d = 0;
+    void* hv = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &hv, n));
+    auto* host = static_cast<uint8_t*>(hv);
+    for (size_t i = 0; i < n; ++i) host[i] = uint8_t(i * 3 + 1);
+    uint8_t* out = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&out), n));
+    sgStats_t s0{}, s1{}, s2{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyD2H(out, d, n));
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(std::memcmp(out, host, n) == 0);
+    VmDelta v = vm_delta(s0, s1);
+    CHECK(v.faults >= 1 && v.faults <= pages);
+    CHECK(v.migrations == pages);
+    CHECK(v.prefetches <= v.migrations);
+    CHECK(v.migrations - v.prefetches <= v.faults); // every demand migration was a fault
+    CHECK(v.evictions == 0 && v.writebacks == 0);
+    CHECK(v.bytes == n);
+    CHECK(v.tlb_misses >= 1);
+    if (prefetch_window() == 0) CHECK(v.prefetches == 0 && v.faults == pages);
+
+    CHECK_OK(sgMemcpyD2H(out, d, n));
+    CHECK_OK(sgGetStats(&s2));
+    v = vm_delta(s1, s2);
+    CHECK(v.faults == 0 && v.migrations == 0 && v.bytes == 0);
+    CHECK(v.tlb_hits + v.tlb_misses >= pages);
+
+    // Under pressure: evictions happen, dirty ones are written back, and
+    // bytes_migrated counts both directions.
+    auto held = squeeze_vram(8);
+    sgStats_t s3{}, s4{};
+    CHECK_OK(sgGetStats(&s3));
+    CHECK_OK(sgMemset(d, 0x3C, n)); // one command over all 32 pages, 8 frames
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgGetStats(&s4));
+    v = vm_delta(s3, s4);
+    CHECK(v.evictions >= pages - 8);
+    CHECK(v.writebacks >= 1 && v.writebacks <= v.evictions);
+    CHECK(v.bytes == (v.migrations + v.writebacks) * pg);
+    CHECK_OK(sgMemcpyD2H(out, d, n));
+    CHECK(std::all_of(out, out + n, [](uint8_t x) { return x == 0x3C; }));
+    for (sgDevPtr p : held) CHECK_OK(sgFree(p));
+    CHECK_OK(sgFreeHost(out));
+    CHECK_OK(sgFree(d));
+}
+
+static void test_managed_prefetch_sequential() {
+    // One copy walking 256 pages forward. With a window of P, each window
+    // costs the fault that started it plus at most one more (the engine can
+    // overtake a prefetch still in progress).
+    const size_t pages = 256, pg = 4096, n = pages * pg;
+    const uint64_t P = prefetch_window();
+    sgDevPtr d = 0;
+    void* hv = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &hv, n));
+    auto* host = static_cast<uint8_t*>(hv);
+    for (size_t i = 0; i < n; ++i) host[i] = uint8_t(i / pg + i);
+    uint8_t* out = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&out), n));
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyD2H(out, d, n));
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(std::memcmp(out, host, n) == 0);
+    const VmDelta v = vm_delta(s0, s1);
+    CHECK(v.migrations == pages);
+    if (P == 0) {
+        CHECK(v.faults == pages);
+        CHECK(v.prefetches == 0);
+    } else {
+        CHECK(v.faults <= 2 + 2 * (pages / (P + 1) + 1));
+        CHECK(v.prefetches >= pages / 2);
+    }
+    std::printf("      [256-page walk, window %llu: %llu faults, %llu prefetched]\n",
+                (unsigned long long)P, (unsigned long long)v.faults, (unsigned long long)v.prefetches);
+    CHECK_OK(sgFreeHost(out));
+    CHECK_OK(sgFree(d));
+}
+
+static void test_managed_prefetch_strided() {
+    // Visit pages 0, 7, 14, ... (mod 256): page x-1 was touched 73 faults
+    // before x, far outside the streams the driver tracks, so nothing may
+    // look sequential and every page is its own fault.
+    const size_t pages = 256, pg = 4096, n = pages * pg;
+    sgDevPtr d = 0;
+    void* hv = nullptr;
+    CHECK_OK(sgMallocManaged(&d, &hv, n));
+    auto* host = static_cast<uint8_t*>(hv);
+    for (size_t i = 0; i < n; ++i) host[i] = uint8_t(i / pg);
+    uint8_t* out = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&out), n));
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    for (size_t k = 0; k < pages; ++k) {
+        const size_t p = (k * 7) % pages;
+        CHECK_OK(sgMemcpyD2HAsync(out + p * pg, d + p * pg, pg, nullptr));
+    }
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(std::memcmp(out, host, n) == 0);
+    const VmDelta v = vm_delta(s0, s1);
+    CHECK(v.prefetches == 0);
+    CHECK(v.faults == pages);
+    CHECK(v.migrations == pages);
+    CHECK_OK(sgFreeHost(out));
+    CHECK_OK(sgFree(d));
+}
+
+static void test_managed_prefetch_stays_in_allocation() {
+    // Two managed allocations back to back in VA. Walking all of `a` must
+    // not migrate any page of `b`, however large the window.
+    const size_t pages = 8, pg = 4096, n = pages * pg;
+    sgDevPtr a = 0, b = 0;
+    void *ha = nullptr, *hb = nullptr;
+    CHECK_OK(sgMallocManaged(&a, &ha, n));
+    CHECK_OK(sgMallocManaged(&b, &hb, n));
+    std::memset(ha, 0x61, n);
+    std::memset(hb, 0x62, n);
+    std::vector<uint8_t> out(n);
+    sgStats_t s0{}, s1{}, s2{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyD2H(out.data(), a, n));
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t x) { return x == 0x61; }));
+    CHECK(vm_delta(s0, s1).migrations == pages);
+    CHECK_OK(sgMemcpyD2H(out.data(), b, n));
+    CHECK_OK(sgGetStats(&s2));
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t x) { return x == 0x62; }));
+    CHECK(vm_delta(s1, s2).migrations == pages);
+    CHECK(vm_delta(s1, s2).faults >= 1);
+    CHECK_OK(sgFree(a));
+    CHECK_OK(sgFree(b));
+}
+
+static void test_managed_prefetch_under_pressure() {
+    // Three channels stream 48-page buffers through 6 free frames at once.
+    // Prefetch may evict, but never so much that a channel's demand page is
+    // gone before it resumes; a livelock here is a ctest timeout.
+    const size_t frames = 6, pages = 48, pg = 4096, n = pages * pg;
+    const int S = 3;
+    sgDevPtr d[S] = {};
+    void* h[S] = {};
+    uint8_t* out[S] = {};
+    sgStream_t st[S] = {};
+    for (int s = 0; s < S; ++s) {
+        CHECK_OK(sgMallocManaged(&d[s], &h[s], n));
+        for (size_t i = 0; i < n; ++i) static_cast<uint8_t*>(h[s])[i] = uint8_t(s * 50 + i / pg);
+        CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&out[s]), n));
+        CHECK_OK(sgStreamCreate(&st[s]));
+    }
+    auto held = squeeze_vram(frames);
+    // One stream alone: a window larger than the free frames would evict
+    // its own prefetched pages before the copy reached them, and they would
+    // migrate twice. Capped, every page moves in exactly once.
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyD2HAsync(out[0], d[0], n, st[0]));
+    CHECK_OK(sgStreamSynchronize(st[0]));
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(std::memcmp(out[0], h[0], n) == 0);
+    CHECK(vm_delta(s0, s1).migrations == pages);
+    for (int rep = 0; rep < 3; ++rep) {
+        for (int s = 0; s < S; ++s) {
+            std::memset(out[s], 0, n);
+            CHECK_OK(sgMemcpyD2HAsync(out[s], d[s], n, st[s]));
+        }
+        for (int s = 0; s < S; ++s) {
+            CHECK_OK(sgStreamSynchronize(st[s]));
+            CHECK(std::memcmp(out[s], h[s], n) == 0);
+        }
+    }
+    for (sgDevPtr p : held) CHECK_OK(sgFree(p));
+    for (int s = 0; s < S; ++s) {
+        CHECK_OK(sgStreamDestroy(st[s]));
+        CHECK_OK(sgFreeHost(out[s]));
+        CHECK_OK(sgFree(d[s]));
+    }
+}
+
+static void test_tlb_reach() {
+    // The compute TLB has 64 entries with LRU replacement. A working set
+    // inside its reach hits on every later pass; a cyclic walk over twice
+    // that misses on every page (LRU's worst case).
+    for (size_t pages : {size_t{32}, size_t{128}}) {
+        const size_t n = pages * 4096;
+        sgDevPtr d = 0;
+        CHECK_OK(sgMalloc(&d, n));
+        CHECK_OK(sgMemset(d, 1, n));
+        CHECK_OK(sgDeviceSynchronize());
+        sgStats_t s0{}, s1{};
+        CHECK_OK(sgGetStats(&s0));
+        CHECK_OK(sgMemset(d, 2, n));
+        CHECK_OK(sgDeviceSynchronize());
+        CHECK_OK(sgGetStats(&s1));
+        const uint64_t hits = s1.engine_tlb_hits[0] - s0.engine_tlb_hits[0];
+        const uint64_t misses = s1.engine_tlb_misses[0] - s0.engine_tlb_misses[0];
+        if (pages <= 64) CHECK(hits == pages && misses == 0);
+        else CHECK(hits == 0 && misses == pages);
+        CHECK_OK(sgFree(d));
+    }
+}
+
 int main() {
     CHECK(sgInit() == SG_OK);
     CHECK(sgInit() == SG_ERR_ALREADY_INITIALIZED);
@@ -895,6 +1279,15 @@ int main() {
         {"concurrent_submitters", test_concurrent_submitters},
         {"managed_migrate_in", test_managed_migrate_in},
         {"managed_two_channels", test_managed_two_channels},
+        {"managed_evict_writeback", test_managed_evict_writeback},
+        {"managed_oversubscribed_compute", test_managed_oversubscribed_compute},
+        {"managed_tlb_shootdown", test_managed_tlb_shootdown},
+        {"managed_stats", test_managed_stats},
+        {"managed_prefetch_sequential", test_managed_prefetch_sequential},
+        {"managed_prefetch_strided", test_managed_prefetch_strided},
+        {"managed_prefetch_stays_in_allocation", test_managed_prefetch_stays_in_allocation},
+        {"managed_prefetch_under_pressure", test_managed_prefetch_under_pressure},
+        {"tlb_reach", test_tlb_reach},
     };
     for (auto& t : tests) {
         int before = g_failures;

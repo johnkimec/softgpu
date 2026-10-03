@@ -4,11 +4,20 @@
 // Device addresses in sg_cmd are virtual. Engines translate through a
 // modeled TLB; a miss walks the page table. sgMalloc installs an
 // always-resident identity map (VA == PA) for its range. Managed pages
-// are present but host-resident until a fault migrates them into VRAM.
+// are present but host-resident until a fault migrates them into some
+// VRAM frame; eviction turns them back into host-resident pages.
 //
 // Page-table entries and TLB tags are atomics: the driver writes them on
 // map/unmap, the engine threads read them on every access. No lock on the
 // translate path.
+//
+// Shootdown protocol: a mapping change stores the PTE, bumps tlb_gen_, and
+// clears matching tags; a TLB fill stores its tag, then re-reads tlb_gen_.
+// Both sides are seq_cst, so either the filler sees the bump and drops its
+// tag or the shootdown sees the tag and clears it. That makes the TLB clean
+// once the shootdown returns; it does not stop an access that already
+// translated. The caller waits for those (Device::quiesce) before reusing
+// the frame.
 
 #include <atomic>
 #include <cstdint>
@@ -49,13 +58,13 @@ struct Translate {
 // use translate(), which may fill a TLB.
 struct PageInfo {
     enum Kind { Absent, Host, Vram } kind = Absent;
-    uint64_t host = 0; // kind == Host
+    uint64_t host = 0; // managed backing page (either kind); 0 for sgMalloc pages
     uint64_t pa = 0;   // kind == Vram
 };
 
 class Mmu {
 public:
-    explicit Mmu(uint64_t va_bytes);
+    Mmu(uint64_t va_bytes, uint64_t vram_bytes);
 
     // Install / remove VRAM mappings. `va` and `pa` must be page-aligned;
     // `npages` pages are mapped contiguously. Safe to call while engines
@@ -67,10 +76,25 @@ public:
     // following pages are contiguous. Device access faults instead of
     // returning a pointer.
     int map_host(uint64_t va, uint64_t host, uint64_t npages);
-    // Host-resident page becomes the identity VRAM frame at `pa`.
+    // Host-resident page now lives in the VRAM frame at `pa`, clean.
     // Already-resident is success.
     int make_resident(uint64_t va, uint64_t pa);
     int unmap(uint64_t va, uint64_t npages);
+
+    // Eviction, in two halves around Device::quiesce(). begin_evict turns
+    // a VRAM page back into a host-resident one and shoots it down; it
+    // returns the old PTE (frame + dirty), or 0 if the page was not in
+    // VRAM. An engine that translated before the shootdown may still write
+    // the frame and OR in DIRTY; end_evict, called after quiesce, collects
+    // those late bits and returns them.
+    uint64_t begin_evict(uint64_t va);
+    uint64_t end_evict(uint64_t va);
+    // CLOCK reference bit. Clears ACCESSED and returns whether it was set.
+    // No TLB flush (x86 Linux does the same): only a walk sets ACCESSED, so
+    // a page hit purely through a TLB looks idle and may be evicted while
+    // hot. Cheap scans, imprecise LRU; the eviction shootdown keeps it
+    // correct.
+    bool test_and_clear_accessed(uint64_t va);
 
     PageInfo page(uint64_t va) const;
 
@@ -105,8 +129,9 @@ private:
     void tlb_invalidate_vpn(uint64_t vpn);
 
     std::unique_ptr<std::atomic<uint64_t>[]> pte_;  // index = VPN
-    std::unique_ptr<std::atomic<uint64_t>[]> host_; // valid when present and not in VRAM
+    std::unique_ptr<std::atomic<uint64_t>[]> host_; // managed backing, kept while mapped
     uint64_t npages_;
+    uint64_t vram_pages_;
     EngineTlb tlb_[SG_MAX_ENGINES];
     // Bumped after a PTE is cleared so an insert that raced the unmap
     // drops its tag instead of publishing a stale translation.
