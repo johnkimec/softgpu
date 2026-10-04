@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>softgpu</title>
+<meta name="description" content="How a software model of a GPU driver went from a mailbox and two spinning cores to rings, a page table, a runlist, and a Linux char device.">
+<style>
+  @font-face {
+    font-family: "Excalifont";
+    src: url("fonts/Excalifont-Regular.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+  :root {
+    --paper: #f4f3ef;
+    --ink: #1c1c1c;
+    --muted: #5e5e5a;
+    --faint: #8a8a84;
+    --line: #d9d7d0;
+    --accent: #a33d2a;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Excalifont, "Segoe Print", "Comic Sans MS", ui-rounded, sans-serif;
+    font-size: 19px;
+    line-height: 1.45;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+  }
+  a { color: inherit; }
+  code {
+    font-family: inherit;
+    font-size: 0.92em;
+  }
+  h1, h2, h3 { text-wrap: balance; font-weight: 400; }
+  p { text-wrap: pretty; }
+  .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; }
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 28px 0 0;
+    font-size: 16px;
+  }
+  header a { color: var(--muted); text-decoration: none; margin-left: 18px; }
+  header a:hover, header a:focus-visible { color: var(--ink); }
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(260px, 0.95fr);
+    gap: 12px 28px;
+    align-items: center;
+    padding: 36px 0 8px;
+  }
+  .kicker { margin: 0; color: var(--muted); font-size: 16px; }
+  h1 { font-size: clamp(34px, 4.6vw, 52px); line-height: 1.05; margin: 8px 0 14px; }
+  .lede { margin: 0 0 22px; max-width: 34em; }
+  .stats {
+    list-style: none; margin: 6px 0 0; padding: 0;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+  }
+  .stats li { margin: 0; color: var(--muted); }
+  .stats b { display: block; color: var(--ink); font-weight: 400; }
+  .stats em { font-style: normal; color: var(--accent); }
+  .sketch { margin: 0; }
+  .sketch svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .sketch figcaption { margin: 0 4px 0 8%; color: var(--muted); font-size: 15px; max-width: 36em; }
+  section { padding: 48px 0 8px; }
+  h2 { font-size: 28px; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 22px; max-width: 40em; }
+  .layout { display: grid; grid-template-columns: 210px 1fr; gap: 28px; align-items: start; }
+  .rail {
+    display: flex; flex-direction: column; gap: 0;
+    position: sticky; top: 16px; max-height: calc(100dvh - 32px); overflow: auto;
+  }
+  .rail button {
+    appearance: none; text-align: left; cursor: pointer;
+    background: transparent; color: var(--muted); border: 0;
+    padding: 5px 0 5px 14px;
+    font: inherit; font-size: 17px;
+    position: relative;
+  }
+  .rail button .idx { color: var(--faint); margin-right: 8px; }
+  .rail button[aria-pressed="true"] { color: var(--ink); }
+  .rail button[aria-pressed="true"]::before {
+    content: "";
+    position: absolute; left: 0; top: 0.55em;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent);
+  }
+  .rail button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .panel h3 { margin: 0 0 4px; font-size: 26px; }
+  .panel .meta { color: var(--muted); margin-bottom: 12px; font-size: 16px; }
+  .panel p { margin: 0; max-width: 40em; }
+  .figure { margin: 0 0 28px; }
+  .figure svg { width: 100%; height: auto; display: block; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px 18px;
+    margin: 8px 0 0; padding: 0; list-style: none;
+    color: var(--muted); font-size: 15px;
+  }
+  .legend i {
+    display: inline-block; width: 22px; height: 0;
+    border-top: 2px solid; margin-right: 6px; vertical-align: middle;
+  }
+  .caption { color: var(--muted); font-size: 15px; margin: 8px 0 0; max-width: 46em; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; font-variant-numeric: tabular-nums; }
+  caption { text-align: left; }
+  th, td { text-align: left; padding: 7px 8px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 400; }
+  td.num, th.num { text-align: right; padding-right: 0; }
+  footer { padding: 36px 0 56px; color: var(--muted); font-size: 15px; }
+  @media (max-width: 800px) {
+    .hero, .layout, .cols, .stats { grid-template-columns: 1fr; }
+    .rail { position: static; flex-direction: row; overflow-x: auto; max-height: none; }
+    .rail button { white-space: nowrap; padding-right: 14px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span>softgpu</span>
+    <nav>
+      <a href="#stages">Stages</a>
+      <a href="#wake">Idle</a>
+      <a href="#numbers">Numbers</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <div>
+      <p class="kicker">A driver stack, measured on a 6-vCPU ARM VM</p>
+      <h1>From a mailbox and two spinning cores to a char device.</h1>
+      <p class="lede">softgpu is a software model of a GPU. The device is threads and <code>memcpy</code> on a 1&nbsp;GHz clock. The stack above it is the real subject: rings, fences, interrupts, a page table, a runlist, and the user/kernel boundary those things sit on.</p>
+    </div>
+    <figure class="sketch">
+      <svg viewBox="0 0 700 320" role="img" aria-labelledby="sk-title sk-desc">
+        <title id="sk-title">softgpu, sketched in isometric</title>
+        <desc id="sk-desc">A hand-drawn card. A host page on the left stores into a command ring on the die. Two small blocks are the compute and copy engines. A rust-colored dot is the doorbell.</desc>
+        <g fill="none" stroke="#2a2a2a" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 128 Q30 74 122 62 Q134 128 126 188 Q46 206 22 128 Z"/>
+          <path d="M44 112 Q78 102 104 96"/>
+          <path d="M40 130 Q82 116 110 110"/>
+          <path d="M48 148 Q76 140 98 134"/>
+          <path d="M126 118 Q146 132 168 148"/>
+          <path d="M160 142 l10 8 M160 142 l8 -6"/>
+          <path d="M150 168 Q290.7 114.9 430 58 Q510.7 106.8 590 158 Q449.2 211.0 310 268 Q229.2 219.4 150 168 Z"/>
+          <path d="M310 268 Q450.4 214.1 590 158 Q591.2 166.0 590.4 174 Q450.1 227.8 310.8 284 Q309.6 276.0 310 268 Z"/>
+          <path d="M430 58 Q510.7 106.9 590 158 Q589.2 166.0 590.4 174 Q509.7 125.0 430.3 74 Q431.0 66.0 430 58 Z"/>
+          <path d="M150 168 Q229.4 218.9 310 268 Q311.6 275.9 310.8 284 Q230.8 233.2 149.7 184 Q149.1 176.0 150 168 Z"/>
+          <path d="M219.6 146.2 Q304.1 114.4 387.6 80.2 Q428.2 104.3 467.6 130.2 Q383.1 161.9 299.6 196.2 Q259.0 172.2 219.6 146.2 Z"/>
+          <path d="M299.6 196.2 Q383.9 163.9 467.6 130.2 Q468.2 137.2 467.6 144.2 Q383.3 176.5 299.6 210.2 Q299.1 203.2 299.6 196.2 Z"/>
+          <path d="M219.6 146.2 Q260.0 170.5 299.6 196.2 Q299.0 203.2 299.6 210.2 Q259.2 185.8 219.6 160.2 Q220.1 153.2 219.6 146.2 Z"/>
+          <path d="M246 135.6 Q268.7 127.5 290.8 118 Q302.3 124.6 313.2 132 Q290.6 140.2 268.4 149.6 Q257 142.9 246 135.6 Z"/>
+          <path d="M268.4 149.6 Q290.9 141.2 313.2 132 Q313.5 137 313.2 142 Q290.7 150.4 268.4 159.6 Q268.2 154.6 268.4 149.6 Z"/>
+          <path d="M290.8 118 Q302.2 124.7 313.2 132 Q312.9 137 313.2 142 Q301.8 135.3 290.8 128 Q291 123 290.8 118 Z"/>
+          <path d="M335.6 100.4 Q358.3 92.3 380.4 82.8 Q391.9 89.4 402.8 96.8 Q380.2 105 358 114.4 Q346.6 107.7 335.6 100.4 Z"/>
+          <path d="M358 114.4 Q380.5 106 402.8 96.8 Q403.1 101.8 402.8 106.8 Q380.3 115.2 358 124.4 Q357.8 119.4 358 114.4 Z"/>
+          <path d="M380.4 82.8 Q391.8 89.5 402.8 96.8 Q402.5 101.8 402.8 106.8 Q391.4 100.1 380.4 92.8 Q380.6 87.8 380.4 82.8 Z"/>
+          <path d="M364 136 C386 134 400 144 398 154 C396 166 380 174 360 170 C338 166 330 154 334 144 C338 134 346 134 364 136"/>
+          <path d="M355 253 l0.4 9 M394 238 l0.4 9 M433 223 l0.5 9 M472 207 l0.5 9 M512 192 l0.4 9 M551 176 l0.4 9"/>
+          <path d="M465 83 l1 10 M494 101 l1 10 M523 119 l1 10 M552 137 l1 10"/>
+          <path d="M506 140 Q512 132 520 128 Q526 136 520 146 Q512 152 506 146 Q500 140 506 140"/>
+          <path d="M522 132 Q560 112 604 104"/>
+        </g>
+        <circle cx="512" cy="138" r="3.4" fill="#a33d2a"/>
+        <circle cx="378" cy="154" r="2.2" fill="#1c1c1c"/>
+        <g fill="#1c1c1c" stroke="none" font-family="Excalifont, ui-rounded, sans-serif">
+          <text x="36" y="58" font-size="16">host</text>
+          <text x="318" y="226" font-size="16" transform="rotate(-20 370 226)">softgpu</text>
+          <text x="608" y="100" font-size="16">doorbell</text>
+        </g>
+      </svg>
+      <figcaption>Submit stores into the mapped ring and rings the doorbell. It does not ioctl. The two engines are threads on a 1&nbsp;GHz clock.</figcaption>
+    </figure>
+  </div>
+  <ul class="stats">
+    <li><b>2.00 → <em>0.03</em></b>engine cores while idle</li>
+    <li><b>~48 µs</b>to wake a gated engine</li>
+    <li><b>40 → 9 GB/s</b>pinned 1&nbsp;MiB copy, after the page table</li>
+  </ul>
+
+  <section id="stages">
+    <h2>Ten stages, in the order they were built.</h2>
+    <p class="sub">Each one started from a number in the previous record. The stage ids follow the design notes, which is why 7 landed before 5.</p>
+    <div class="layout">
+      <div class="rail" role="radiogroup" aria-label="Project stages" id="rail"></div>
+      <article class="panel" id="panel" aria-live="polite"></article>
+    </div>
+  </section>
+
+  <section id="wake">
+    <h2>What idle costs.</h2>
+    <p class="sub">One 64-byte fill after a quiet gap. <code>spin</code> keeps both engines hot. <code>sleep</code> gates immediately and pays the wake on every command. Hybrid 50&nbsp;µs is the default: gaps inside the budget are free, and a quiet device drops to a few hundredths of a core.</p>
+    <div class="figure">
+      <svg id="lat" viewBox="0 0 720 340" role="img" aria-label="First-command latency versus idle gap, log scale"></svg>
+      <ul class="legend" id="lat-legend"></ul>
+      <p class="caption">Latency of the command that breaks the gap. Log scale. A 10&nbsp;µs budget gates on the 30&nbsp;µs row. 50&nbsp;µs and 200&nbsp;µs both wait until 300&nbsp;µs; the longer budget does not make that command faster. Source: <code>gate-spin.json</code>, <code>gated.json</code>, <code>gate-sleep.json</code>, <code>vm7-idle10k.json</code>, <code>vm7-idle200k.json</code>.</p>
+    </div>
+    <div class="figure">
+      <svg id="cores" viewBox="0 0 720 300" role="img" aria-label="Engine CPU cores versus idle gap"></svg>
+      <p class="caption">Both engines together. 2.0 is the bill this project paid from stage 0 until stage 7, without printing it.</p>
+    </div>
+  </section>
+
+  <section id="numbers">
+    <h2>A few rows that decided something.</h2>
+    <p class="sub">All of these are from the VM, canary-gated, best pass per row. The fast cluster itself drifted from about 208&nbsp;ns to about 375&nbsp;ns across the project, so a later round trip is not automatically a regression.</p>
+    <div class="cols">
+      <table>
+        <caption class="caption" style="caption-side: bottom">Pinned host-to-device, 1&nbsp;MiB. The page table is the break.</caption>
+        <thead><tr><th>Stage</th><th class="num">GB/s</th></tr></thead>
+        <tbody>
+          <tr><td>3a pinned</td><td class="num">65.6</td></tr>
+          <tr><td>4 no global lock</td><td class="num">52.0</td></tr>
+          <tr><td>7 idle gating</td><td class="num">39.5</td></tr>
+          <tr><td>5 virtual memory</td><td class="num">9.0</td></tr>
+        </tbody>
+      </table>
+      <table>
+        <caption class="caption" style="caption-side: bottom">Managed sequential copy, 1&nbsp;MiB. Prefetch is 16 pages.</caption>
+        <thead><tr><th>Mode</th><th class="num">MB/s</th><th class="num">µs/page</th></tr></thead>
+        <tbody>
+          <tr><td>Prefetch on</td><td class="num">469</td><td class="num">8.7</td></tr>
+          <tr><td>Prefetch off</td><td class="num">29</td><td class="num">140</td></tr>
+          <tr><td>Engines spinning</td><td class="num">883</td><td class="num">4.6</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <table style="margin-top: 28px">
+      <caption class="caption" style="caption-side: bottom">Stage 6, <code>fair</code>. A higher priority does not wait out the slice. A 5&nbsp;µs slice spends the engine on switching.</caption>
+      <thead><tr><th>Run</th><th class="num">First probe</th><th class="num">Pair GB/s</th><th class="num">Preempts / op</th></tr></thead>
+      <tbody>
+        <tr><td>No timeslice, equal priority</td><td class="num">210 µs</td><td class="num">39.2</td><td class="num">0</td></tr>
+        <tr><td>50 µs slice, equal</td><td class="num">78 µs</td><td class="num">39.2</td><td class="num">0.09</td></tr>
+        <tr><td>5 µs slice, equal pair</td><td class="num">2.7 µs</td><td class="num">24.9</td><td class="num">0.94</td></tr>
+        <tr><td>Priority, no slice</td><td class="num">28 µs</td><td class="num">—</td><td class="num">0.10</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p>The VM is an M1 Max running Ubuntu under UTM; macOS <code>steady_clock</code> is 1&nbsp;µs, so Mac timings are not quoted.</p>
+  </footer>
+</div>
+<script>
+const stages = [
+  { id: "0", name: "Baseline",
+    meta: "mailbox · one lock · busy poll",
+    body: "One command in flight. The driver takes a single mutex, copies through one staging buffer, and spins until the engine retires the mailbox. Idle costs two cores because both engines spin, and the number is not even reported yet. Correct, layered, and slow in ways the later stages can point at." },
+  { id: "1", name: "Command ring",
+    meta: "depth 1024 · PUT / GET fences",
+    body: "The mailbox becomes a ring of 64-byte commands. PUT is the doorbell, GET is the fence: command n has retired once GET passes it. A depth sweep picked 1024. The round trip on the fast cluster of that week was 208 ns." },
+  { id: "3a", name: "Pinned memory",
+    meta: "8 × 256 KiB staging · deferred free",
+    body: "Pageable copies used to bounce through one buffer, fully serialized. A pool of eight 256 KiB slots lets the host fill the next chunk while the device drains the last. Pinned memory skips the bounce. A 1 MiB pinned copy measured 66 GB/s. Free is deferred until every channel has retired, so an in-flight command cannot use recycled memory." },
+  { id: "3b", name: "Copy engine",
+    meta: "channels · streams · WAIT_FENCE",
+    body: "Engine 0 computes. Engines after it only copy. A stream is one channel index plus a copy engine. Before it submits on a different engine it emits WAIT_FENCE for its own previous fence, so order survives the split. A wait is rejected unless the target is already in the other channel's PUT, which keeps the dependency graph a DAG." },
+  { id: "2", name: "Interrupts",
+    meta: "spin, then futex · 30 µs cap",
+    body: "The host used to busy-poll the fence. It now spins for a budget and then arms an interrupt and sleeps. Adaptive aims the budget at recent waits, with a floor so a short chain does not talk itself into sleeping. The estimator has to time the device, not its own wakeup. The first version timed the wakeup and then slept forever after one long wait." },
+  { id: "4", name: "Per-channel submit",
+    meta: "no global lock · ticket mode",
+    body: "The one mutex is gone. Each channel has its own producer, either a mutex or a lock-free ticket. Ticket mode livelocked when waiters spun and starved the producer holding the next ticket; after a short spin they yield. Publishing PUT before handing the ticket on made PUT go backwards, and the engine ran off the ring. ThreadSanitizer was quiet. The hang was not." },
+  { id: "7", name: "Idle gating",
+    meta: "hybrid 50 µs · 2.0 → 0.03 cores",
+    body: "Engines spin for 50 µs on an empty runlist, then sleep on a futex. The driver stores PUT, fences, and loads an asleep flag. The engine does the reverse. Without both fences a doorbell can be lost on ARM64; a 1 ms timeout counts that. A 10 µs budget already pays a 38 µs wake on a 30 µs gap. A 200 µs budget is no faster than 50 µs on any gap we measured, and at 300 µs it still burns half a core. The knee is the wake-up itself. Dropping the Dekker fences produced no missed doorbell on wake or mt. The fences stay. Waking every sleeper on every retirement was the bug that kept the idle copy engine at a full core." },
+  { id: "5", name: "Virtual memory",
+    meta: "1 GiB VA · faults · prefetch 16",
+    body: "Commands take virtual addresses. sgMalloc is identity-mapped and resident. Managed pages start in host memory, fault in, and get evicted with CLOCK when VRAM is full. A sequential fault also pulls the next 16 pages. That is the difference between 29 MB/s and 469 MB/s on a 1 MiB stream. A fault is about 100 µs with the engines gating and about 38 µs if they spin: the parked engine sleeps through its idle budget and has to be rung. The page table cut a pinned 1 MiB copy from 40 GB/s to 9 GB/s. userfaultfd makes the host side fault back." },
+  { id: "6", name: "Scheduling",
+    meta: "priority · timeslice at a command boundary",
+    body: "The runlist runs the highest-priority channel. More negative wins, and 0 is the default. Equal priorities share the engine in visits of SG_TIMESLICE_NS, or until the channel blocks if the slice is 0. A higher priority preempts at the next command and does not wait out the slice. With no slice, the first probe behind a greedy peer waits 210 µs. A 5 µs slice gets the probe in, and pair throughput falls from 39 GB/s to 25 GB/s because the engine spends the time switching." },
+  { id: "8", name: "Char device",
+    meta: "/dev/softgpu · mmap rings · threaded IRQ",
+    body: "The rings and the doorbell page are allocated by a kernel module and mapped into the process. Submit stores a command and a doorbell word. It does not ioctl. A blocked host sleeps on a kernel wait queue. The engine raises an interrupt with one ioctl, and a workqueue item is the threaded ISR that wake_up()s the waiters. The device threads stay in the process: they dereference host pointers and run userfaultfd. The runtime source is the same." }
+];
+
+const rail = document.getElementById("rail");
+const panel = document.getElementById("panel");
+stages.forEach((s, i) => {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.setAttribute("role", "radio");
+  b.setAttribute("aria-checked", i === 6 ? "true" : "false");
+  b.setAttribute("aria-pressed", i === 6 ? "true" : "false");
+  b.innerHTML = `<span class="idx">${s.id}</span>${s.name}`;
+  b.addEventListener("click", () => select(i));
+  rail.appendChild(b);
+});
+function select(i) {
+  [...rail.children].forEach((b, j) => {
+    const on = j === i;
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    b.setAttribute("aria-checked", on ? "true" : "false");
+  });
+  const s = stages[i];
+  panel.innerHTML = `<h3>${s.name}</h3><div class="meta">stage ${s.id} · ${s.meta}</div><p>${s.body}</p>`;
+}
+select(6);
+
+const gaps = [1, 30, 300, 3000, 30000];
+const series = [
+  { name: "spin", color: "#8a877f", dash: "", width: 1.5, ns: [333, 334, 459, 2875, 5416], cores: [1.95, 1.99, 2.00, 2.00, 2.00] },
+  { name: "hybrid 50 µs", color: "#a33d2a", dash: "", width: 2.2, ns: [333, 333, 49125, 47501, 49792], cores: [0.99, 0.98, 0.16, 0.039, 0.026] },
+  { name: "hybrid 10 µs", color: "#1c1c1c", dash: "", width: 1.5, ns: [375, 38332, 49706, 47207, 53456], cores: [0.97, 0.28, 0.068, 0.032, 0.024] },
+  { name: "hybrid 200 µs", color: "#6a6a66", dash: "7 5", width: 1.5, ns: [375, 375, 48833, 49458, 53959], cores: [0.94, 1.01, 0.51, 0.084, 0.031] },
+  { name: "sleep", color: "#3a3a38", dash: "1.5 4", width: 1.5, ns: [21500, 29417, 49084, 51625, 67001], cores: [0.27, 0.15, 0.042, 0.027, 0.026] }
+];
+const font = "Excalifont, ui-rounded, sans-serif";
+const grid = "#e4e2db";
+const axis = "#6a6a66";
+
+function logChart(svg, pick, y0, y1, yTicks, yFmt) {
+  const W = 720, H = 340, L = 64, R = 16, T = 16, B = 36;
+  const x0 = Math.log10(1), x1 = Math.log10(30000);
+  const X = g => L + (Math.log10(g) - x0) / (x1 - x0) * (W - L - R);
+  const Y = v => T + (1 - (Math.log10(v) - y0) / (y1 - y0)) * (H - T - B);
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (n, a) => { const e = document.createElementNS(ns, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+  yTicks.forEach(t => {
+    svg.appendChild(el("line", { x1: L, x2: W - R, y1: Y(t), y2: Y(t), stroke: grid }));
+    svg.appendChild(el("text", { x: L - 8, y: Y(t) + 4, fill: axis, "font-size": "13", "text-anchor": "end", "font-family": font })).textContent = yFmt(t);
+  });
+  gaps.forEach(g => {
+    const label = g >= 1000 ? (g / 1000) + " ms" : g + " µs";
+    svg.appendChild(el("text", { x: X(g), y: H - 10, fill: axis, "font-size": "13", "text-anchor": "middle", "font-family": font })).textContent = label;
+  });
+  series.forEach(s => {
+    const pts = gaps.map((g, i) => `${X(g)},${Y(pick(s)[i])}`).join(" ");
+    const attrs = { points: pts, fill: "none", stroke: s.color, "stroke-width": s.width, "stroke-linecap": "round", "stroke-linejoin": "round" };
+    if (s.dash) attrs["stroke-dasharray"] = s.dash;
+    svg.appendChild(el("polyline", attrs));
+  });
+}
+function linChart(svg, pick, yMax) {
+  const W = 720, H = 300, L = 48, R = 16, T = 16, B = 36;
+  const x0 = Math.log10(1), x1 = Math.log10(30000);
+  const X = g => L + (Math.log10(g) - x0) / (x1 - x0) * (W - L - R);
+  const Y = v => T + (1 - v / yMax) * (H - T - B);
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (n, a) => { const e = document.createElementNS(ns, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+  [0, 0.5, 1, 1.5, 2].forEach(t => {
+    svg.appendChild(el("line", { x1: L, x2: W - R, y1: Y(t), y2: Y(t), stroke: grid }));
+    svg.appendChild(el("text", { x: L - 8, y: Y(t) + 4, fill: axis, "font-size": "13", "text-anchor": "end", "font-family": font })).textContent = t.toFixed(1);
+  });
+  gaps.forEach(g => {
+    const label = g >= 1000 ? (g / 1000) + " ms" : g + " µs";
+    svg.appendChild(el("text", { x: X(g), y: H - 10, fill: axis, "font-size": "13", "text-anchor": "middle", "font-family": font })).textContent = label;
+  });
+  series.forEach(s => {
+    const pts = gaps.map((g, i) => `${X(g)},${Y(pick(s)[i])}`).join(" ");
+    const attrs = { points: pts, fill: "none", stroke: s.color, "stroke-width": s.width, "stroke-linecap": "round", "stroke-linejoin": "round" };
+    if (s.dash) attrs["stroke-dasharray"] = s.dash;
+    svg.appendChild(el("polyline", attrs));
+  });
+}
+logChart(document.getElementById("lat"), s => s.ns, 2.4, 5, [1000, 10000, 50000], v => v >= 1000 ? (v / 1000) + " µs" : v + " ns");
+linChart(document.getElementById("cores"), s => s.cores, 2.2);
+const legend = document.getElementById("lat-legend");
+series.forEach(s => {
+  const li = document.createElement("li");
+  const dash = s.dash ? `border-top-style:dashed` : "";
+  li.innerHTML = `<i style="border-top-color:${s.color};border-top-width:${s.width}px;${dash}"></i>${s.name}`;
+  legend.appendChild(li);
+});
+</script>
+</body>
+</html>

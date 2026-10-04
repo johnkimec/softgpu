@@ -170,7 +170,37 @@ public:
     // The driver rings this after storing a channel's PUT. Wakes the engine
     // if it is power-gated. Dekker pattern with the engine's arm/re-check:
     // both sides store then load, with seq_cst fences in between.
+    //
+    // begin/end bracket the PUT store and this call. A timeout that finds a
+    // new PUT while a producer is still inside that window is the safety
+    // net (the doorbell has not been rung yet), not a lost wake-up. TSan
+    // can deschedule the producer there for longer than the 1 ms timeout.
+    void begin_doorbell(uint32_t engine) {
+        doorbell_inflight_[engine].fetch_add(1, std::memory_order_release);
+    }
+    void end_doorbell(uint32_t engine) {
+        doorbell_inflight_[engine].fetch_sub(1, std::memory_order_release);
+    }
+    uint32_t doorbell_inflight(uint32_t engine) const {
+        return doorbell_inflight_[engine].load(std::memory_order_acquire);
+    }
+    // Stage 8: the words live on the char device's doorbell page. Null when
+    // the rings are ordinary process memory.
+    void set_doorbell_words(std::atomic<uint32_t>* words) { doorbell_words_ = words; }
+    using HostIrqFn = void (*)(void*);
+    // Replaces the in-process IRQ futex. The char device's threaded ISR
+    // wakes host waiters; the engine futexes stay, because the engines are
+    // still threads in this process.
+    void set_host_irq(HostIrqFn fn, void* ctx) {
+        host_irq_fn_ = fn;
+        host_irq_ctx_ = ctx;
+    }
+    void raise_host_irq() {
+        if (host_irq_fn_) host_irq_fn_(host_irq_ctx_);
+        else irq_.signal();
+    }
     void doorbell(uint32_t engine) {
+        if (doorbell_words_) doorbell_words_[engine].fetch_add(1, std::memory_order_relaxed);
         if (!no_fence_) std::atomic_thread_fence(std::memory_order_seq_cst);
         if (asleep_[engine].load(std::memory_order_relaxed)) {
             // Timestamp the wake so the engine's idle-gap estimator measures
@@ -229,6 +259,10 @@ private:
     std::mutex fault_mu_;
     std::deque<Fault> faults_;
     Event bell_[SG_MAX_ENGINES];
+    std::atomic<uint32_t> doorbell_inflight_[SG_MAX_ENGINES] = {};
+    std::atomic<uint32_t>* doorbell_words_ = nullptr;
+    HostIrqFn host_irq_fn_ = nullptr;
+    void* host_irq_ctx_ = nullptr;
     std::atomic<bool> asleep_[SG_MAX_ENGINES] = {};
     std::atomic<bool> asleep_blocked_[SG_MAX_ENGINES] = {}; // asleep with work pending behind a WAIT_FENCE
     std::atomic<uint64_t> wake_stamp_[SG_MAX_ENGINES] = {}; // when the last wake was requested

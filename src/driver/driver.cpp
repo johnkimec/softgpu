@@ -138,7 +138,10 @@ int device_cpu_from_env() {
     return e ? std::atoi(e) : -1;
 }
 
-struct FreeDeleter { void operator()(void* p) const { std::free(p); } };
+struct RingDeleter {
+    bool free_it = true;
+    void operator()(void* p) const { if (free_it && p) std::free(p); }
+};
 
 struct Fence {
     uint32_t engine = 0;
@@ -179,6 +182,10 @@ struct Driver;
 
 void service_faults(Driver* self);
 #if defined(__linux__)
+void attach_kmod(Driver& d);
+void kmod_raise_irq(void* ctx);
+#endif
+#if defined(__linux__)
 void service_host_faults(Driver* self);
 int open_userfaultfd();
 #endif
@@ -201,7 +208,7 @@ struct Driver {
     uint32_t submit_mode = SG_SUBMIT_MUTEX;
     device::Device dev{SG_VRAM_SIZE, SG_VA_SIZE, copy_engines_from_env(), channels_from_env()};
 
-    std::unique_ptr<sg_cmd, FreeDeleter> ring[SG_MAX_ENGINES][SG_MAX_CHANNELS];
+    std::unique_ptr<sg_cmd, RingDeleter> ring[SG_MAX_ENGINES][SG_MAX_CHANNELS];
     uint32_t depth = 0;
     Producer prod[SG_MAX_ENGINES][SG_MAX_CHANNELS];
 
@@ -279,20 +286,46 @@ struct Driver {
     int uffd_kick = -1;
     std::thread uffd_th;
 
+    // Stage 8. -1 / null when /dev/softgpu is absent (macOS, or SG_KMOD=0):
+    // rings are process memory and the host IRQ is the device's futex.
+    // open_error is set only for SG_KMOD=require, so a missing module fails
+    // the open instead of quietly falling back.
+    int open_error = 0;
+    int kmod_fd = -1;
+    void* kmod_mem = nullptr;
+    size_t kmod_bytes = 0;
+    sg_kmod_ctrl* kmod_ctrl = nullptr;
+
     Driver() {
         num_engines = dev.num_engines();
         num_channels = dev.num_channels();
         submit_mode = submit_mode_from_env();
         depth = ring_depth_from_env();
+#if defined(__linux__)
+        attach_kmod(*this);
+        if (open_error) return;
+#endif
         for (uint32_t e = 0; e < num_engines; ++e)
             for (uint32_t c = 0; c < num_channels; ++c) {
-                void* mem = nullptr;
-                if (posix_memalign(&mem, 64, size_t{depth} * sizeof(sg_cmd)) != 0) std::abort();
-                std::memset(mem, 0, size_t{depth} * sizeof(sg_cmd));
-                ring[e][c].reset(static_cast<sg_cmd*>(mem));
+                if (kmod_mem) {
+                    auto* cmds = reinterpret_cast<sg_cmd*>(static_cast<uint8_t*>(kmod_mem) +
+                                                           sg_kmod_ring_off(e, c, num_channels, depth));
+                    ring[e][c] = std::unique_ptr<sg_cmd, RingDeleter>(cmds, RingDeleter{false});
+                } else {
+                    void* mem = nullptr;
+                    if (posix_memalign(&mem, 64, size_t{depth} * sizeof(sg_cmd)) != 0) std::abort();
+                    std::memset(mem, 0, size_t{depth} * sizeof(sg_cmd));
+                    ring[e][c].reset(static_cast<sg_cmd*>(mem));
+                }
                 dev.channel(e, c).ring_base = reinterpret_cast<uint64_t>(ring[e][c].get());
                 dev.channel(e, c).ring_mask = depth - 1;
             }
+#if defined(__linux__)
+        if (kmod_ctrl) {
+            dev.set_doorbell_words(reinterpret_cast<std::atomic<uint32_t>*>(kmod_ctrl->doorbell));
+            dev.set_host_irq(kmod_raise_irq, this);
+        }
+#endif
         slots = staging_slots_from_env();
         chunk = staging_chunk_from_env();
         staging.assign(size_t{slots} * chunk, 0);
@@ -337,10 +370,66 @@ struct Driver {
         if (uffd_th.joinable()) uffd_th.join();
         if (uffd >= 0) ::close(uffd);
         if (uffd_kick >= 0) ::close(uffd_kick);
+        if (kmod_mem) {
+            ::munmap(kmod_mem, kmod_bytes);
+            kmod_mem = nullptr;
+            kmod_ctrl = nullptr;
+        }
+        if (kmod_fd >= 0) {
+            ::close(kmod_fd);
+            kmod_fd = -1;
+        }
     }
 
     uint8_t* slot_ptr(uint32_t i) { return staging.data() + size_t{i} * chunk; }
 };
+
+#if defined(__linux__)
+// Map the char device's rings and doorbell page into this process. The
+// device threads read the same bytes. Failure with SG_KMOD=require sticks
+// on open_error; otherwise the caller keeps the in-process rings.
+void attach_kmod(Driver& d) {
+    const char* e = std::getenv("SG_KMOD");
+    if (e && e[0] == '0' && e[1] == '\0') return;
+    const bool require = e && std::strcmp(e, "require") == 0;
+    int fd = ::open("/dev/softgpu", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        if (require) d.open_error = -errno;
+        else if (std::getenv("SG_TRACE"))
+            std::fprintf(stderr, "[drv] /dev/softgpu: %s (in-process rings)\n", std::strerror(errno));
+        return;
+    }
+    sg_kmod_map map{};
+    map.num_engines = d.num_engines;
+    map.num_channels = d.num_channels;
+    map.depth = d.depth;
+    if (ioctl(fd, SG_IOC_KMOD_MAP, &map) != 0 || map.bytes == 0) {
+        int err = errno;
+        ::close(fd);
+        if (require) d.open_error = err ? -err : -EIO;
+        return;
+    }
+    void* mem = ::mmap(nullptr, map.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        int err = errno;
+        ::close(fd);
+        if (require) d.open_error = -err;
+        return;
+    }
+    d.kmod_fd = fd;
+    d.kmod_mem = mem;
+    d.kmod_bytes = map.bytes;
+    d.kmod_ctrl = static_cast<sg_kmod_ctrl*>(mem);
+}
+
+// Top half of the device interrupt: the engine has stored `get` and cleared
+// irq_target. The module's workqueue is the bottom half and wakes waiters.
+void kmod_raise_irq(void* ctx) {
+    auto* d = static_cast<Driver*>(ctx);
+    if (ioctl(d->kmod_fd, SG_IOC_KMOD_IRQ) != 0 && std::getenv("SG_TRACE"))
+        std::fprintf(stderr, "[drv] SG_IOC_KMOD_IRQ: %s\n", std::strerror(errno));
+}
+#endif
 
 std::mutex g_open_lock;
 std::unique_ptr<Driver> g_drv;
@@ -460,15 +549,35 @@ int wait_until(Driver& d, Pred pred, Arm arm, uint32_t flags, std::atomic<uint64
     if (done) {
         d.waits_spun.fetch_add(1, std::memory_order_relaxed);
     } else {
-        // Block phase.
+        // Block phase. With the char device loaded, the sleep is a kernel
+        // wait queue woken by the threaded ISR. Otherwise it is the
+        // device's futex, same protocol: sample the sequence, arm, recheck,
+        // then sleep, so a pulse between the check and the sleep is not lost.
         d.waits_blocked.fetch_add(1, std::memory_order_relaxed);
-        Event& irq = d.dev.irq();
-        for (;;) {
-            const uint32_t seen = irq.seq();
-            arm();
-            if (pred()) break;
-            irq.wait(seen, kBlockTimeoutNs);
-            if (pred()) break;
+#if defined(__linux__)
+        if (d.kmod_fd >= 0) {
+            auto* seq = reinterpret_cast<std::atomic<uint32_t>*>(&d.kmod_ctrl->irq_seq);
+            for (;;) {
+                const uint32_t seen = seq->load(std::memory_order_acquire);
+                arm();
+                if (pred()) break;
+                sg_kmod_sleep sl{};
+                sl.seen = seen;
+                sl.timeout_ns = kBlockTimeoutNs;
+                if (ioctl(d.kmod_fd, SG_IOC_KMOD_SLEEP, &sl) != 0 && errno == EINTR) continue;
+                if (pred()) break;
+            }
+        } else
+#endif
+        {
+            Event& irq = d.dev.irq();
+            for (;;) {
+                const uint32_t seen = irq.seq();
+                arm();
+                if (pred()) break;
+                irq.wait(seen, kBlockTimeoutNs);
+                if (pred()) break;
+            }
         }
     }
     // Only the adaptive policy needs to know how long this took. For a
@@ -584,9 +693,13 @@ uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd
     // before ours landed, so the device's PUT went backwards and the engine
     // ran off the end of the ring forever (ADR 005). Every access here is
     // atomic, so TSan had nothing to say; the hang did.
+    // begin/end covers the gap a descheduled producer leaves between the
+    // PUT store and the doorbell (ADR 006, the TSan false miss).
+    d.dev.begin_doorbell(engine);
     regs.put.store(slot + 1, std::memory_order_release); // release: slot before doorbell
     p.put.store(slot + 1, std::memory_order_release);
     d.dev.doorbell(engine); // wake the engine if it is power-gated
+    d.dev.end_doorbell(engine);
     return slot + 1;
 }
 
@@ -1168,6 +1281,11 @@ extern "C" int sg_drv_open(void) {
     std::lock_guard<std::mutex> g(g_open_lock);
     if (!g_drv) {
         g_drv = std::make_unique<Driver>();
+        if (g_drv->open_error) {
+            int err = g_drv->open_error;
+            g_drv.reset();
+            return err;
+        }
         g_drv->dev.power_on(device_cpu_from_env());
     }
     ++g_refs;
@@ -1229,6 +1347,7 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         q->priority_least = SG_PRIORITY_LEAST;
         q->priority_greatest = SG_PRIORITY_GREATEST;
         q->timeslice_ns = d.timeslice_ns;
+        q->kmod = d.kmod_fd >= 0 ? 1u : 0u;
         return 0;
     }
     case SG_IOC_ALLOC: {

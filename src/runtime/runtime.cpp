@@ -52,6 +52,7 @@ namespace {
 
 int g_fd = -1;
 int g_managed_coherent = 0;
+int g_kmod = 0;
 uint32_t g_num_engines = 1;
 uint32_t g_num_ce = 0;
 uint32_t g_num_channels = 1;
@@ -258,6 +259,7 @@ sgError_t sgInit(void) {
     }
     g_fd = fd;
     g_managed_coherent = q.uffd ? 1 : 0;
+    g_kmod = q.kmod ? 1 : 0;
     g_num_engines = q.num_engines;
     g_num_ce = q.num_engines - 1;
     g_num_channels = q.num_channels;
@@ -282,11 +284,16 @@ sgError_t sgShutdown(void) {
     int rc = sg_drv_close(g_fd);
     g_fd = -1;
     g_managed_coherent = 0;
+    g_kmod = 0;
     return from_errno(rc);
 }
 
 int sgManagedCoherent(void) {
     return g_fd >= 0 && g_managed_coherent ? 1 : 0;
+}
+
+int sgUsingKernel(void) {
+    return g_fd >= 0 && g_kmod ? 1 : 0;
 }
 
 void sgHoldHostFaults(int hold) {

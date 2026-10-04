@@ -12,6 +12,7 @@
 #                                        #   SG_RUNS=5 separate processes are merged (best pass per row)
 #                                        #   SG_FORCE=1 to bench even on a loaded host
 #   scripts/vm.sh canary                 # print the round-trip canary (ns); ~210 / ~590 on a quiet host
+#   scripts/vm.sh kmod                   # build kmod/softgpu.ko on the VM (load needs sudo)
 #   scripts/vm.sh shell                  # ssh into the VM at the source dir
 set -euo pipefail
 
@@ -128,6 +129,17 @@ case "$cmd" in
     echo "saved results/$tag.json ($runs runs per benchmark, host load $(host_load))"
     ;;
   canary) configure_and_build release >/dev/null; echo "$(canary_ns) ns" ;;
+  kmod)
+    # The 9p share is not a build tree: the module is compiled on the VM disk.
+    remote "set -euo pipefail
+      rm -rf \$HOME/build/softgpu-kmod
+      mkdir -p \$HOME/build/softgpu-kmod
+      cp -a $SRC/kmod \$HOME/build/softgpu-kmod/kmod
+      cp -a $SRC/include \$HOME/build/softgpu-kmod/include
+      make -C \$HOME/build/softgpu-kmod/kmod -j\$(nproc)"
+    echo "built ~/build/softgpu-kmod/kmod/softgpu.ko"
+    echo "load: ssh -t $VM 'sudo insmod ~/build/softgpu-kmod/kmod/softgpu.ko && ls -l /dev/softgpu'"
+    ;;
   shell) ssh -t "$VM" "cd $SRC && exec \$SHELL -l" ;;
   *) echo "unknown command: $cmd" >&2; exit 1 ;;
 esac

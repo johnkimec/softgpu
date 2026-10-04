@@ -101,6 +101,8 @@ sgError_t sgFree(sgDevPtr ptr);
 sgError_t sgMallocManaged(sgDevPtr* dev, void** host, size_t bytes);
 /* 1 when host accesses migrate in-VRAM managed pages back (Linux userfaultfd). */
 int sgManagedCoherent(void);
+/* 1 when the command rings and the host interrupt line are /dev/softgpu. */
+int sgUsingKernel(void);
 /* Test latch. While held, a host fault is counted and then waits before the
  * handler takes its lock, so sgFree can run against a blocked host access.
  * Not a device feature. */

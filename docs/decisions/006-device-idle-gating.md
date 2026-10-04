@@ -99,20 +99,23 @@ change.
 * **H4** The knee of the budget sweep sits at the wake-up latency again
   (~30 µs); adaptive matches the best fixed budget without tuning.
 * **H5** Dropping the fences produces measurable lost doorbells on ARM64
-  (kept as a negative experiment, `results/gated-nofence.json`).
+  (kept as a negative experiment, `results/vm7-nofence.json`).
 
 ## Results
 
 Stage 4 (`results/nolock.json`) vs stage 7 default (`results/gated.json`,
 hybrid 50 µs), plus `gate-spin.json` and `gate-sleep.json`. Same-cluster
 mode, best of 15 passes across 5 processes per benchmark, canary-gated.
-ASan clean on all 10 variants; TSan clean on 9 — `runtime_ch1_ticket`
-(lock-free ticket publishing, one channel, 8 producers) exceeds even a
-400 s timeout under TSan's slowdown and reports no race; it is the stage 4
-livelock-turned-slow-path, not a gating issue. The fixed-budget sweep and
-the no-fence experiment were cut short (the host spent most of a night in
-its slow placement mode); H4 and H5 are therefore left as stated, not
-confirmed.
+ASan clean on all 10 variants; TSan clean on 9. `runtime_ch1_ticket`
+(lock-free ticket publishing, one channel, 8 producers) used to either
+time out or fail `gating_no_missed_doorbells` under TSan with no race
+reported. A producer descheduled for longer than the engine's 1 ms
+timeout, between the PUT store and `doorbell()`, made that timeout find
+work and count a miss. The counter now ignores a PUT whose doorbell is
+still in flight. On 2026-10-04, TSan `runtime_ch1_ticket` passed in 31 s
+and `runtime_gated` in 46 s, with no race report. The fixed-budget sweep and the no-fence experiment were
+run later, canary-gated, fast cluster 375 ns (`results/vm7-idle10k.json`,
+`vm7-idle200k.json`, `vm7-nofence.json`).
 
 ### First-command latency vs idle power (`wake`: idle gap, then one 64 B fill + spin-sync)
 
@@ -137,6 +140,38 @@ paying since stage 0 without printing it.
   budget cost exactly what `spin` costs. Note the `spin` column itself climbs
   to 2.9–5.4 µs at long gaps: that is the *host* thread waking from
   `nanosleep` cold; the gating cost is the difference, ~45 µs.
+* **H4, the knee: confirmed. The adaptive half: not.** A budget shorter
+  than the wake pays it too early. At 10 µs the 30 µs gap is already a
+  38 µs command and 0.28 cores (`vm7-idle10k.json`, canary 375 ns). At
+  50 µs that same gap is still the spin canary, 333 ns and ~1 core, and
+  the 300 µs gap is the ~49 µs wake. At 200 µs the 30 µs gap is still the
+  canary (375 ns) and the 300 µs gap is still a ~49 µs wake, but the
+  engine has spun through its budget, so that row costs 0.51 cores
+  instead of 0.16 (`vm7-idle200k.json`, canary 375 ns before and after).
+  Lengthening the budget past the wake does not make the first command
+  faster. Adaptive was not re-run; the original measurement stands, and
+  it does not match the best fixed budget (917 ns vs 333 ns at a 1 µs gap).
+
+| gap | 10 µs p50 · cores | **50 µs** p50 · cores | 200 µs p50 · cores |
+|---:|---:|---:|---:|
+| 1 µs | 375 ns · 0.97 | **333 ns · 0.99** | 375 ns · 0.94 |
+| 30 µs | 38 µs · 0.28 | **333 ns · 0.98** | 375 ns · 1.01 |
+| 300 µs | 50 µs · 0.07 | **49 µs · 0.16** | 49 µs · 0.51 |
+| 3 ms | 47 µs · 0.03 | **48 µs · 0.04** | 49 µs · 0.08 |
+| 30 ms | 53 µs · 0.02 | **50 µs · 0.03** | 54 µs · 0.03 |
+
+  The 50 µs column is the earlier fast cluster (333 ns). 10 µs and 200 µs
+  are the 375 ns cluster from 2026-10-04. Read latency against that run's
+  own canary, not against 333.
+
+* **H5 not confirmed.** `SG_EXPERIMENT_NO_FENCE=1` with the engine in
+  `sleep` and the host spinning, on `wake` and `mt`, five processes each,
+  canary 375 ns before and after (`vm7-nofence.json`). `missed_doorbells`
+  was 0 on every row of every process, not only on the fastest pass.
+  The fences stay. One clean run that did not lose a doorbell is not a
+  reason to delete the barrier the memory model requires; it is a reason
+  not to claim the race showed up.
+
 * **H3 confirmed with one exception.** `submit` (166/292 ns), `memcpy`,
   `gemm`, `pipeline` wall time (+5–10%) and per-stream `mt` (+2%) are within
   noise. Default-stream `mt` at 8 threads fell 23%: with all threads serialized
@@ -169,9 +204,13 @@ paying since stage 0 without printing it.
 * The price is a ~48 µs first-command latency after any idle stretch longer
   than 50 µs. Latency-critical callers can set `SG_ENGINE_IDLE=spin`; a
   per-channel "keep awake" hint is the natural next refinement.
-* The doorbell is now a real wake-up path with a Dekker-style arm/re-check;
-  the stage-8 kernel module's ISR/bottom-half is the same protocol with the
-  fences supplied by the kernel's `smp_mb()`.
+* The doorbell is now a real wake-up path with a Dekker-style arm/re-check.
+  The stage-8 module's wait queue is the same protocol, with the kernel's
+  barrier in place of the explicit fence. The no-fence run
+  (`vm7-nofence.json`) did not lose a doorbell; the fences stay anyway.
+* A missed doorbell is a doorbell that finished and was not heard. A PUT
+  whose `doorbell()` has not returned yet is the safety net, which is what
+  TSan was counting.
 * Two stages in a row, an adaptive estimator failed by measuring its own
   penalty. Rule recorded: an estimator's input must come from the workload's
   timeline (doorbell or interrupt timestamps), never from the policy's.

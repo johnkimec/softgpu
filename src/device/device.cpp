@@ -301,7 +301,7 @@ void Device::run(uint32_t engine) {
                         ch.last_irq_cycles.store(t, std::memory_order_relaxed);
                         note_irq(t);
                         st.irqs.fetch_add(1, std::memory_order_relaxed);
-                        irq_.signal();
+                        raise_host_irq();
                     }
                 }
                 continue;
@@ -401,7 +401,7 @@ void Device::run(uint32_t engine) {
                     ch.last_irq_cycles.store(t, std::memory_order_relaxed);
                     note_irq(t);
                     st.irqs.fetch_add(1, std::memory_order_relaxed);
-                    irq_.signal();
+                    raise_host_irq();
                 }
                 if (k.get == put) put = ch.put.load(std::memory_order_acquire);
                 if (k.get == put) break;
@@ -517,13 +517,20 @@ void Device::run(uint32_t engine) {
                     st.wakeups.fetch_add(1, std::memory_order_relaxed);
                     woke = bell_[engine].seq() != seen;
                     if (!woke) {
-                        // Timeout, not a signal. If there is work, someone
-                        // rang a doorbell we did not hear: a lost wake-up.
+                        // Timeout, not a signal. A new PUT only counts as a
+                        // lost wake-up once every producer has finished
+                        // doorbell(). Otherwise the safety net woke us in
+                        // the gap between the PUT store and the ring, which
+                        // is not a missed doorbell — and under TSan that gap
+                        // can be longer than this timeout.
+                        bool arrived = false;
                         for (uint32_t c = 0; c < num_channels_; ++c)
                             if (ch_[engine][c].put.load(std::memory_order_acquire) != seen_put[c]) {
-                                st.missed_doorbells.fetch_add(1, std::memory_order_relaxed);
+                                arrived = true;
                                 break;
                             }
+                        if (arrived && doorbell_inflight(engine) == 0)
+                            st.missed_doorbells.fetch_add(1, std::memory_order_relaxed);
                     }
                     (pending ? st.wait_cycles : st.idle_cycles).fetch_add(t_wake - t_sleep, std::memory_order_relaxed);
                     mark = t_wake;

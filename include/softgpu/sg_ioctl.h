@@ -4,21 +4,33 @@
  * softgpu driver ABI.
  *
  * This is the contract between the user-mode runtime (src/runtime) and the
- * kernel-mode driver (src/driver). Today the driver is a userspace stand-in;
- * stage 8 replaces its implementation with a Linux char device that speaks
- * this exact ABI, so this header must stay plain C: fixed-width types,
- * explicit layout, no C++.
+ * driver. The driver is a userspace library on macOS and when /dev/softgpu
+ * is absent. On Linux, stage 8's char device (kmod/softgpu.c) owns the
+ * command rings, the doorbell page, and the host interrupt line. This
+ * header stays plain C: fixed-width types, explicit layout, no C++.
  *
  * Every stage of the project changes *implementations* behind this ABI,
  * not the ABI itself, unless a design decision explicitly calls for it.
  */
+#ifdef __KERNEL__
+#include <linux/ioctl.h>
+#include <linux/types.h>
+typedef __u8 uint8_t;
+typedef __u32 uint32_t;
+typedef __u64 uint64_t;
+typedef __s32 int32_t;
+#else
 #include <stdint.h>
+#if defined(__linux__)
+#include <sys/ioctl.h>
+#endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   11u
+#define SG_ABI_VERSION   12u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_PAGE_SIZE     4096ull       /* device page; allocation granularity   */
 #define SG_VA_SIZE       (1ull << 30)  /* device VA space: [0, VRAM) sgMalloc (VA == PA), [VRAM, VA) managed */
@@ -129,6 +141,8 @@ struct sg_query_args {
     int32_t priority_least;     /* lowest channel priority (inclusive); the default */
     int32_t priority_greatest;  /* highest channel priority (inclusive); more negative */
     uint64_t timeslice_ns;      /* 0: a visit runs until the channel blocks or empties */
+    uint32_t kmod;              /* 1: rings, doorbell page, and host IRQ are /dev/softgpu */
+    uint32_t reserved3;
 };
 
 struct sg_alloc_args {
@@ -235,27 +249,6 @@ struct sg_stats_args {
     uint64_t host_fault_ns; /* summed handler time for those (not the wakeup)   */
 };
 
-/*
- * Request codes. Plain integers for now; the kernel module will wrap them in
- * _IOWR() with the same ordinals so the runtime does not change.
- */
-enum sg_ioc {
-    SG_IOC_QUERY       = 0x5301, /* sg_query_args  */
-    SG_IOC_ALLOC       = 0x5302, /* sg_alloc_args  */
-    SG_IOC_FREE        = 0x5303, /* sg_free_args   */
-    SG_IOC_SUBMIT      = 0x5304, /* sg_submit_args */
-    SG_IOC_STATS       = 0x5305, /* sg_stats_args  */
-    SG_IOC_RESET_STATS = 0x5306, /* no argument    */
-    SG_IOC_WAIT        = 0x5307, /* sg_wait_args   */
-    SG_IOC_PIN           = 0x5308, /* sg_pin_args            */
-    SG_IOC_UNPIN         = 0x5309, /* sg_pin_args (size ignored) */
-    SG_IOC_ALLOC_MANAGED = 0x530A, /* sg_alloc_managed_args  */
-    /* Test latch: nonzero makes the host-fault handler wait before mem_lock.
-     * int *. Not a device feature. */
-    SG_IOC_UFFD_HOLD     = 0x530B,
-    SG_IOC_SET_PRIORITY  = 0x530C  /* sg_priority_args */
-};
-
 /* Program one channel's priority on one engine. Out-of-range values are
  * rejected (the runtime clamps before it calls). Takes effect at the next
  * command boundary on that engine. */
@@ -265,6 +258,85 @@ struct sg_priority_args {
     int32_t priority;
     uint32_t reserved;
 };
+
+/*
+ * Request codes. On Linux these are _IOWR(0x53, ordinal, ...) with the same
+ * ordinals the earlier stages used as raw 0x53xx values, so the runtime
+ * keeps calling sg_drv_ioctl with these names. macOS keeps the raw numbers:
+ * there is no char device there.
+ *
+ * SG_IOC_KMOD_* are the char device's own calls. The userspace driver uses
+ * them; the runtime does not. SUBMIT stays a userspace write into the
+ * mmap'd ring (no ioctl per command). ALLOC and the rest stay in the
+ * userspace driver because they dereference host pointers and, on Linux,
+ * userfaultfd. The kernel module accepts the classic ordinals and returns
+ * -ENOTTY for them: they are not its job.
+ */
+#if defined(__linux__)
+#define SG_IOC_QUERY         _IOWR(0x53, 0x01, struct sg_query_args)
+#define SG_IOC_ALLOC         _IOWR(0x53, 0x02, struct sg_alloc_args)
+#define SG_IOC_FREE          _IOW(0x53, 0x03, struct sg_free_args)
+#define SG_IOC_SUBMIT        _IOWR(0x53, 0x04, struct sg_submit_args)
+#define SG_IOC_STATS         _IOR(0x53, 0x05, struct sg_stats_args)
+#define SG_IOC_RESET_STATS   _IO(0x53, 0x06)
+#define SG_IOC_WAIT          _IOW(0x53, 0x07, struct sg_wait_args)
+#define SG_IOC_PIN           _IOW(0x53, 0x08, struct sg_pin_args)
+#define SG_IOC_UNPIN         _IOW(0x53, 0x09, struct sg_pin_args)
+#define SG_IOC_ALLOC_MANAGED _IOWR(0x53, 0x0A, struct sg_alloc_managed_args)
+#define SG_IOC_UFFD_HOLD     _IOW(0x53, 0x0B, int) /* test latch; not a device feature */
+#define SG_IOC_SET_PRIORITY  _IOW(0x53, 0x0C, struct sg_priority_args)
+#else
+#define SG_IOC_QUERY         0x5301u
+#define SG_IOC_ALLOC         0x5302u
+#define SG_IOC_FREE          0x5303u
+#define SG_IOC_SUBMIT        0x5304u
+#define SG_IOC_STATS         0x5305u
+#define SG_IOC_RESET_STATS   0x5306u
+#define SG_IOC_WAIT          0x5307u
+#define SG_IOC_PIN           0x5308u
+#define SG_IOC_UNPIN         0x5309u
+#define SG_IOC_ALLOC_MANAGED 0x530Au
+#define SG_IOC_UFFD_HOLD     0x530Bu
+#define SG_IOC_SET_PRIORITY  0x530Cu
+#endif
+
+/* Page 0 of the char device mapping. Rings follow, one page-aligned run each. */
+struct sg_kmod_ctrl {
+    uint32_t irq_seq;                    /* kernel bottom half; waiters load-acquire */
+    uint32_t reserved0;
+    uint32_t doorbell[SG_MAX_ENGINES];   /* user-mode doorbell, one word per engine */
+    uint32_t reserved1[10];
+};
+
+struct sg_kmod_map {
+    uint32_t num_engines;  /* in  */
+    uint32_t num_channels; /* in  */
+    uint32_t depth;        /* in: commands per ring, power of two */
+    uint32_t bytes;        /* out: mmap length                    */
+};
+
+struct sg_kmod_sleep {
+    uint32_t seen;       /* in: irq_seq value the waiter already observed */
+    uint32_t reserved;
+    uint64_t timeout_ns; /* safety net; the waiter rechecks its fence     */
+};
+
+static inline uint64_t sg_kmod_ring_bytes(uint32_t depth) {
+    uint64_t n = (uint64_t)depth * 64u;
+    return (n + 4095u) & ~4095ull;
+}
+static inline uint64_t sg_kmod_map_bytes(uint32_t engines, uint32_t channels, uint32_t depth) {
+    return 4096ull + (uint64_t)engines * (uint64_t)channels * sg_kmod_ring_bytes(depth);
+}
+static inline uint64_t sg_kmod_ring_off(uint32_t engine, uint32_t channel, uint32_t channels, uint32_t depth) {
+    return 4096ull + ((uint64_t)engine * channels + channel) * sg_kmod_ring_bytes(depth);
+}
+
+#if defined(__linux__)
+#define SG_IOC_KMOD_MAP   _IOWR(0x53, 0x20, struct sg_kmod_map)
+#define SG_IOC_KMOD_IRQ   _IO(0x53, 0x21) /* device -> threaded ISR          */
+#define SG_IOC_KMOD_SLEEP _IOW(0x53, 0x22, struct sg_kmod_sleep)
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

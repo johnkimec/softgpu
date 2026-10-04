@@ -3,3 +3,8 @@ build/
 compile_commands.json
 *.o
 *.a
+*.ko
+*.mod
+*.mod.c
+modules.order
+Module.symvers

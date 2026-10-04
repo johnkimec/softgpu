@@ -730,6 +730,23 @@ static void test_ticket_publish_storm() {
 
 // ---- stage 7: device idle gating ---------------------------------------------
 
+static void test_kernel_device() {
+    // The char device is optional. SG_KMOD=require is the ctest variant that
+    // refuses the in-process fallback, so this is where that contract is
+    // checked: rings came from /dev/softgpu and a command still retires.
+    const char* e = std::getenv("SG_KMOD");
+    const bool require = e && std::strcmp(e, "require") == 0;
+    if (!require && !sgUsingKernel()) return;
+    CHECK(sgUsingKernel() == 1);
+    sgDevPtr d = 0;
+    uint8_t host[64] = {};
+    CHECK_OK(sgMalloc(&d, 64));
+    CHECK_OK(sgMemset(d, 0x5a, 64));
+    CHECK_OK(sgMemcpyD2H(host, d, 64));
+    CHECK(host[0] == 0x5a && host[63] == 0x5a);
+    CHECK_OK(sgFree(d));
+}
+
 static void test_gating_no_missed_doorbells() {
     // Many single tiny commands each followed by a host spin-wait: under a
     // sleeping engine every submit hits the arm/re-check window. A lost
@@ -1516,6 +1533,10 @@ static void test_timeslice_interleaves() {
 
 int main() {
     CHECK(sgInit() == SG_OK);
+    if (g_failures) {
+        std::printf("FAILED (%d failure%s)\n", g_failures, g_failures == 1 ? "" : "s");
+        return 1;
+    }
     CHECK(sgInit() == SG_ERR_ALREADY_INITIALIZED);
 
     struct { const char* name; void (*fn)(); } tests[] = {
@@ -1546,6 +1567,7 @@ int main() {
         {"alloc_storm_during_submits", test_alloc_storm_during_submits},
         {"pin_storm_during_copies", test_pin_storm_during_copies},
         {"ticket_publish_storm", test_ticket_publish_storm},
+        {"kernel_device", test_kernel_device},
         {"gating_no_missed_doorbells", test_gating_no_missed_doorbells},
         {"gating_power_when_idle", test_gating_power_when_idle},
         {"concurrent_submitters", test_concurrent_submitters},

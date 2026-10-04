@@ -91,4 +91,11 @@ set_tests_properties(runtime_uffd0 PROPERTIES ENVIRONMENT "SG_UFFD=0")
 # of the same priority can run.
 add_test(NAME runtime_slice COMMAND sgtest)
 set_tests_properties(runtime_slice PROPERTIES ENVIRONMENT "SG_TIMESLICE_NS=20000" TIMEOUT 180)
+# Char device: rings and the host IRQ line come from /dev/softgpu. Absent on
+# macOS. On Linux the test runs only once the module is loaded; until then
+# it skips, so a normal ctest does not depend on root.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_test(NAME runtime_kmod COMMAND bash -c "if [ ! -e /dev/softgpu ]; then echo 'skipped: /dev/softgpu is not loaded'; exit 0; fi; exec \"$<TARGET_FILE:sgtest>\"")
+  set_tests_properties(runtime_kmod PROPERTIES ENVIRONMENT "SG_KMOD=require" TIMEOUT 180)
+endif()
 set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 runtime_prefetch0 runtime_uffd0 PROPERTIES TIMEOUT 120)
