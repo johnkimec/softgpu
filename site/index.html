@@ -45,12 +45,9 @@
   p { text-wrap: pretty; }
   .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; }
   header {
-    display: flex; justify-content: space-between; align-items: baseline;
     padding: 28px 0 0;
     font-size: 16px;
   }
-  header a { color: var(--muted); text-decoration: none; margin-left: 18px; }
-  header a:hover, header a:focus-visible { color: var(--ink); }
   .hero {
     display: grid;
     grid-template-columns: minmax(0, 1.05fr) minmax(260px, 0.95fr);
@@ -128,11 +125,6 @@
 <div class="wrap">
   <header>
     <span>softgpu</span>
-    <nav>
-      <a href="#stages">Stages</a>
-      <a href="#wake">Idle</a>
-      <a href="#numbers">Numbers</a>
-    </nav>
   </header>
 
   <div class="hero">
