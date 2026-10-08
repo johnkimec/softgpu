@@ -15,9 +15,9 @@ kernel      kmod/softgpu.c                 /dev/softgpu
 device      src/device/device.cpp          engines, runlist, MMU, idle gating
 ```
 
-A stage-by-stage walk of the measurements, with the idle-power curves, is at <https://jvkec.github.io/softgpu/>.
+A stage-by-stage walk of the measurements, with the idle-power curves, is at <https://johnkimec.github.io/softgpu/>.
 
-[![softgpu site](site/preview.png)](https://jvkec.github.io/softgpu/)
+[![softgpu site](site/preview.png)](https://johnkimec.github.io/softgpu/)
 
 ## Stages
 
